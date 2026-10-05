@@ -1,0 +1,40 @@
+[package]
+name = "vpush-server"
+description = "VPush server library: config, logging, API, admin socket"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+license-file.workspace = true
+build = "build.rs"
+
+[dependencies]
+vpush-proto = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+ring = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+async-trait = { workspace = true }
+nostr = { workspace = true }
+nostr-sdk = { workspace = true }
+futures-util = { workspace = true }
+sqlx = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+reqwest = { workspace = true }
+# `test-util`: a test stops the clock to see a deadline pass without waiting for it.
+tokio = { workspace = true, features = ["test-util"] }
+nostr-sdk = { workspace = true, features = ["local-relay"] }

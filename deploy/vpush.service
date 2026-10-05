@@ -1,0 +1,57 @@
+[Unit]
+Description=VPush (Veydan push server)
+# After docker too: when the reverse proxy runs in a container, VPush listens
+# on the docker bridge address, which exists only once docker is up. Where
+# there is no docker this orders nothing.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=vpush
+Group=vpush
+ExecStart=/opt/vpush/current/vpush serve --config /opt/vpush/etc/vpush.toml
+# Re-reads the config; log levels are applied without a restart.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+
+# What the server makes is for itself and its group: the database holds the
+# devices' addresses at the push service.
+UMask=0027
+
+# /run/vpush, where the admin socket lives.
+RuntimeDirectory=vpush
+RuntimeDirectoryMode=0750
+
+# The server needs the network and its own directories, and nothing else of
+# the machine. What a bug in it could reach is cut down to that.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RemoveIPC=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/opt/vpush/data
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
