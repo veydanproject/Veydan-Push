@@ -5,7 +5,8 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 use vpush_proto::{
-    Channel, DeviceAnswer, DevicePut, ErrorBody, ErrorCode, Payload, Prefs, PushType, RelayStatus,
+    Channel, DeviceAnswer, DevicePut, ErrorBody, ErrorCode, Info, Payload, Prefs, PushType,
+    RelayStatus, TicketAsk, TicketIssued, TicketList, Wake, WakeAnswer, SEALED_BUDGET,
 };
 
 fn golden(name: &str) -> String {
@@ -127,4 +128,72 @@ fn pushes() {
     assert_eq!(group.to_data()["count"], "3");
     assert!(group.event.is_none());
     assert!(group.event_id.is_some() && group.relay.is_some());
+}
+
+/// The gateway: a device registered at a private push server with a ticket
+/// and its push key, the tickets it takes, the wake and the push it makes.
+#[test]
+fn the_gateway() {
+    let put: DevicePut = round_trip("device_put_gateway.json");
+    let Channel::Gateway { ticket, pubkey } = &put.channel else {
+        panic!("{:?}", put.channel)
+    };
+    assert_eq!((ticket.len(), pubkey.len()), (64, 64));
+    assert_eq!(put.channel.provider(), "gateway");
+
+    let ask: TicketAsk = round_trip("ticket_ask.json");
+    assert_eq!(ask.device_id, "phone-0001");
+    let issued: TicketIssued = round_trip("ticket_issued.json");
+    assert_eq!(&issued.ticket, ticket);
+    let list: TicketList = round_trip("tickets.json");
+    assert_eq!(list.tickets[0].ticket, format!("{}…", &ticket[..8]));
+    assert_eq!(list.tickets[0].last_wake_at, Some(1_790_003_600));
+    assert_eq!(list.tickets[1].last_wake_at, None);
+
+    let wake: Wake = round_trip("wake.json");
+    assert_eq!(&wake.ticket, ticket);
+    assert!(wake.blob.len() <= SEALED_BUDGET);
+    assert!(!wake.urgent, "a wake that says nothing of it is not urgent");
+    // The wake of a call: the one that asks for high priority.
+    let call: Wake = round_trip("wake_urgent.json");
+    assert!(call.urgent);
+    assert_eq!((&call.ticket, &call.sender), (&wake.ticket, &wake.sender));
+    assert!(call.blob.len() <= SEALED_BUDGET);
+    let answer: WakeAnswer = round_trip("wake_answer.json");
+    assert_eq!(answer.trace.len(), 8);
+
+    // What the gateway sends: the blob and the sender, as the wake gave them.
+    let sealed: Payload = round_trip("push_sealed.json");
+    assert_eq!(sealed.kind, PushType::Sealed);
+    assert_eq!((sealed.blob.as_ref(), sealed.sender.as_ref()), (Some(&wake.blob), Some(&wake.sender)));
+    let keys: Vec<_> = sealed.to_data().into_keys().collect();
+    assert_eq!(keys, ["blob", "sender", "trace", "type", "v"]);
+    assert!(sealed.fits());
+
+    let refused: ErrorBody = round_trip("error_ticket_unknown.json");
+    assert_eq!(refused.error.code, ErrorCode::TicketUnknown);
+}
+
+/// `/v1/info` of a gateway says it issues tickets; of a private push server,
+/// which gateway it wakes through and who seals its pushes. An older client
+/// reads both, and sees neither.
+#[test]
+fn what_a_gateway_and_a_private_server_say_of_themselves() {
+    let gateway: Info = round_trip("info_gateway.json");
+    let tickets = gateway.tickets.expect("a gateway issues tickets");
+    assert_eq!((tickets.days, tickets.per_device), (30, 8));
+    assert!(gateway.gateway.is_none());
+
+    let private: Info = round_trip("info_private.json");
+    assert_eq!(private.apps[0].providers, ["gateway"]);
+    let through = private.gateway.expect("a private server names its gateway");
+    assert_eq!(through.url, "https://eu-1-vpush.veydan.net");
+    assert_eq!(through.sender, serde_json::from_str::<Wake>(&golden("wake.json")).unwrap().sender);
+    assert!(private.tickets.is_none());
+
+    // What a server older than the gateway said reads as before.
+    let mut older: Value = serde_json::from_str(&golden("info_private.json")).unwrap();
+    older.as_object_mut().unwrap().remove("gateway");
+    let older: Info = serde_json::from_value(older).unwrap();
+    assert!(older.gateway.is_none() && older.tickets.is_none());
 }

@@ -61,6 +61,19 @@ pub enum ErrorCode {
     /// The key that signed is denied on every server of the network
     /// (Veydan Cloud): no device of it is registered.
     KeyDenied,
+    /// A ticket is asked for a device the signer has not registered here
+    /// with a push service (`409`).
+    NoDevice,
+    /// The gateway knows no such ticket: expired, deleted, or never issued
+    /// (`404`). The private push server forgets the device, as it would a
+    /// dead token.
+    TicketUnknown,
+    /// The gateway could not hand the wake to the push service: it is busy
+    /// or out of reach (`503`). The wake may be sent again.
+    ProviderUnavailable,
+    /// The push service refused the wake, and sending it again will not
+    /// help (`502`).
+    ProviderRejected,
 }
 
 /// Body of every non-2xx answer.
@@ -94,6 +107,16 @@ pub enum Channel {
         p256dh: String,
         auth: String,
     },
+    /// Through the gateway, at a private push server (`spec/protocol.md`,
+    /// "The gateway"): the ticket the gateway issued for the device's
+    /// token, and the push key of the device every push is sealed to.
+    Gateway {
+        /// 64 hex characters.
+        ticket: String,
+        /// The push key of the device: an x-only secp256k1 key, 64 hex
+        /// characters, made for pushes alone.
+        pubkey: String,
+    },
 }
 
 impl Channel {
@@ -102,6 +125,7 @@ impl Channel {
             Self::Fcm { .. } => "fcm",
             Self::Apns { .. } => "apns",
             Self::Unifiedpush { .. } => "unifiedpush",
+            Self::Gateway { .. } => "gateway",
         }
     }
 }
@@ -253,7 +277,102 @@ pub struct Info {
     pub apps: Vec<AppInfo>,
     pub relays: RelayPolicy,
     pub limits: Limits,
+    /// A private push server: the gateway it wakes devices through, and its
+    /// own key that seals the pushes. Absent on every other server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<GatewayInfo>,
+    /// A gateway: it issues tickets (`/v1/tickets`) and wakes them
+    /// (`/v1/gateway/wake`). Absent on a server that does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tickets: Option<TicketsInfo>,
 }
+
+/// `gateway` of `/v1/info`, on a private push server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayInfo {
+    /// The gateway: the address its own `/v1/info` is at, without a
+    /// trailing slash. The device takes its tickets there.
+    pub url: String,
+    /// The public half of the key this server seals pushes with, 64 hex
+    /// characters: `sender` of every sealed push of this server.
+    pub sender: String,
+}
+
+/// `tickets` of `/v1/info`, on a gateway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketsInfo {
+    /// How long a ticket lives.
+    pub days: u32,
+    /// Live tickets a device holds at most; the oldest goes when one more
+    /// is asked for.
+    pub per_device: u32,
+}
+
+/// Body of `POST /v1/tickets`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketAsk {
+    /// The device the ticket stands for: one the signer registered at the
+    /// gateway with its token.
+    pub device_id: String,
+}
+
+/// Answer of `POST /v1/tickets` (`201`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketIssued {
+    /// 64 hex characters. Said here once: the gateway keeps no copy it can
+    /// say again.
+    pub ticket: String,
+    /// Unix seconds.
+    pub expires_at: u64,
+}
+
+/// Answer of `GET /v1/tickets`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketList {
+    pub tickets: Vec<TicketView>,
+}
+
+/// One live ticket of the signer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketView {
+    /// The first 8 hex of the ticket, and `…`: enough to tell tickets apart
+    /// and to delete one, not enough to wake with.
+    pub ticket: String,
+    pub device_id: String,
+    /// Unix seconds.
+    pub issued_at: u64,
+    pub expires_at: u64,
+    /// When the ticket was last woken; `null` when never.
+    pub last_wake_at: Option<u64>,
+}
+
+/// Body of `POST /v1/gateway/wake`, from a private push server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Wake {
+    /// 64 hex characters.
+    pub ticket: String,
+    /// The push, sealed to the push key of the device: base64url without
+    /// padding of the NIP-44 v2 payload, at most [`SEALED_BUDGET`] characters.
+    pub blob: String,
+    /// The key that sealed it, 64 hex characters.
+    pub sender: String,
+    /// Wake the phone now (high priority at the push service): only for the
+    /// push of a call. Absent or `false`, the push goes at normal priority.
+    /// The one thing of what is inside that the gateway learns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub urgent: bool,
+}
+
+/// Answer of `POST /v1/gateway/wake` (`202`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeAnswer {
+    /// Id of the wake in the gateway's log, and in the push.
+    pub trace: String,
+}
+
+/// The most a sealed push may weigh: characters of `blob`. With the other
+/// keys of a `sealed` push it stays within [`FCM_DATA_BUDGET`].
+pub const SEALED_BUDGET: usize = 3600;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppInfo {
@@ -295,6 +414,10 @@ pub enum PushType {
     Broadcast,
     /// The project manifest changed. Silent.
     ManifestUpdate,
+    /// A push of a private push server, sealed to the push key of the
+    /// device and carried by the gateway: `blob` and `sender`, nothing
+    /// else. Inside is a push of one of the other types.
+    Sealed,
 }
 
 impl PushType {
@@ -306,6 +429,7 @@ impl PushType {
             Self::Test => "test",
             Self::Broadcast => "broadcast",
             Self::ManifestUpdate => "manifest_update",
+            Self::Sealed => "sealed",
         }
     }
 
@@ -363,6 +487,18 @@ pub struct Payload {
     /// would say nothing of a message. `"1"` in the string form.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub call: bool,
+    /// A `test` push sent to check the ticket of a device that has just
+    /// registered at a private push server: the device shows nothing for
+    /// it. `"1"` in the string form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub check: bool,
+    /// `sealed`: the push of a private push server, sealed to the push key
+    /// of the device (base64url of a NIP-44 v2 payload).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    /// `sealed`: the key of the private push server that sealed `blob`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
 }
 
 impl Payload {
@@ -378,6 +514,9 @@ impl Payload {
             data: None,
             trace: None,
             call: false,
+            check: false,
+            blob: None,
+            sender: None,
         }
     }
 
@@ -415,11 +554,16 @@ impl Payload {
         put("event", &self.event);
         put("data", &self.data);
         put("trace", &self.trace);
+        put("blob", &self.blob);
+        put("sender", &self.sender);
         if let Some(count) = self.count {
             out.insert("count".to_string(), count.to_string());
         }
         if self.call {
             out.insert("call".to_string(), "1".to_string());
+        }
+        if self.check {
+            out.insert("check".to_string(), "1".to_string());
         }
         out
     }
@@ -437,6 +581,7 @@ mod tests {
         p.group_id = Some("g1".into());
         p.count = Some(3);
         p.call = true;
+        p.check = true;
 
         let json = serde_json::to_value(&p).unwrap();
         let data = p.to_data();
@@ -448,6 +593,7 @@ mod tests {
         assert_eq!(data["v"], "2");
         assert_eq!(data["call"], "1");
         assert_eq!(json["call"], true);
+        assert_eq!((data["check"].as_str(), &json["check"]), ("1", &serde_json::json!(true)));
         assert!(!Payload::new(PushType::Dm).to_data().contains_key("call"), "a message is not marked");
     }
 
@@ -497,9 +643,28 @@ mod tests {
             (ErrorCode::LimitDevicesTotal, "limit_devices_total"),
             (ErrorCode::RateLimited, "rate_limited"),
             (ErrorCode::KeyDenied, "key_denied"),
+            (ErrorCode::NoDevice, "no_device"),
+            (ErrorCode::TicketUnknown, "ticket_unknown"),
+            (ErrorCode::ProviderUnavailable, "provider_unavailable"),
+            (ErrorCode::ProviderRejected, "provider_rejected"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), word);
         }
+    }
+
+    /// What the gateway sends says who sealed it and nothing of what is
+    /// inside, and the biggest it takes fits FCM.
+    #[test]
+    fn a_sealed_push_is_its_blob_and_its_sender() {
+        let mut p = Payload::new(PushType::Sealed);
+        p.blob = Some("A".repeat(SEALED_BUDGET));
+        p.sender = Some("ab".repeat(32));
+        p.trace = Some("abcd1234".into());
+        let keys: Vec<_> = p.to_data().into_keys().collect();
+        assert_eq!(keys, ["blob", "sender", "trace", "type", "v"]);
+        assert_eq!(p.to_data()["type"], "sealed");
+        assert!(p.fits(), "{} bytes", p.data_len());
+        assert!(!p.is_silent(), "what is inside decides; the device opens it");
     }
 
     #[test]

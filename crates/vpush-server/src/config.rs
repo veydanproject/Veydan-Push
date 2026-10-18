@@ -38,6 +38,13 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    /// The gateway (`spec/protocol.md`, "The gateway"): this server is one
+    /// (`accept`), or wakes its devices through one (`url`), or neither.
+    #[serde(default)]
+    pub gateway: GatewayConfig,
+    /// The tickets a gateway issues.
+    #[serde(default)]
+    pub tickets: TicketsConfig,
     /// The keys denied on every server of the network, one a line, laid by
     /// the agent of vcloud (`spec/protocol.md`, "Denied keys"): a device
     /// of such a key is not registered. Not given: `denied-keys.txt` beside
@@ -147,6 +154,38 @@ impl Default for PipelineConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GatewayConfig {
+    /// This server is a gateway: it issues tickets for the tokens of its
+    /// devices and wakes them for private push servers.
+    pub accept: bool,
+    /// This server is a private one: every device of it is registered with
+    /// a ticket of this gateway, and is woken through it. Its own
+    /// `public_url`, without a trailing slash.
+    pub url: Option<String>,
+    /// The key this server seals pushes with: 64 hex characters, made at
+    /// the first start when the file is missing. Not given: `gateway.key`
+    /// beside the database.
+    pub key_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TicketsConfig {
+    /// How long a ticket lives.
+    pub days: u32,
+    /// Live tickets a device holds at most; the oldest goes when one more
+    /// is asked for.
+    pub per_device: u32,
+}
+
+impl Default for TicketsConfig {
+    fn default() -> Self {
+        Self { days: 30, per_device: 8 }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub fcm: Option<FcmConfig>,
@@ -251,6 +290,32 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// What is wrong with the address of a server, `name` the key it is under:
+/// `https`, `http` for localhost only, no query, no fragment, no trailing
+/// slash.
+fn address_problems(name: &str, address: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    match url::Url::parse(address) {
+        Err(e) => out.push(format!("{name}: {e}")),
+        Ok(u) => {
+            let local = matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+            match u.scheme() {
+                "https" => {}
+                "http" if local => {}
+                "http" => out.push(format!("{name}: http is accepted for localhost only, use https")),
+                other => out.push(format!("{name}: scheme `{other}` is not http(s)")),
+            }
+            if u.query().is_some() || u.fragment().is_some() {
+                out.push(format!("{name}: must not carry a query or a fragment"));
+            }
+            if address.ends_with('/') {
+                out.push(format!("{name}: drop the trailing slash"));
+            }
+        }
+    }
+    out
+}
+
 impl Config {
     /// The file of the denied keys: `denied_keys_file`, or `denied-keys.txt`
     /// in the folder of the database.
@@ -295,26 +360,7 @@ impl Config {
     fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
 
-        match url::Url::parse(&self.public_url) {
-            Err(e) => out.push(format!("public_url: {e}")),
-            Ok(u) => {
-                let local = matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
-                match u.scheme() {
-                    "https" => {}
-                    "http" if local => {}
-                    "http" => out.push(
-                        "public_url: http is accepted for localhost only, use https".to_string(),
-                    ),
-                    other => out.push(format!("public_url: scheme `{other}` is not http(s)")),
-                }
-                if u.query().is_some() || u.fragment().is_some() {
-                    out.push("public_url: must not carry a query or a fragment".to_string());
-                }
-                if self.public_url.ends_with('/') {
-                    out.push("public_url: drop the trailing slash".to_string());
-                }
-            }
-        }
+        out.extend(address_problems("public_url", &self.public_url));
 
         if self.server.listen.parse::<SocketAddr>().is_err() {
             out.push(format!(
@@ -465,7 +511,53 @@ impl Config {
             out.push("pipeline.call_window_secs: must be above zero".to_string());
         }
 
+        let gateway = &self.gateway;
+        if let Some(url) = &gateway.url {
+            out.extend(address_problems("gateway.url", url));
+            if gateway.accept {
+                out.push(
+                    "gateway: `accept` and `url` together; a server is a gateway, or wakes its devices through one"
+                        .to_string(),
+                );
+            }
+        }
+        match &gateway.key_file {
+            Some(_) if gateway.url.is_none() => out.push(
+                "gateway.key_file: a key seals the pushes of a private server; name its gateway in `gateway.url`"
+                    .to_string(),
+            ),
+            Some(path) if !path.is_absolute() => out.push(format!(
+                "gateway.key_file: `{}` must be an absolute path",
+                path.display()
+            )),
+            _ => {}
+        }
+        // A ticket that lives no time, or a device that may hold none, is
+        // a gateway that wakes nobody.
+        if self.tickets.days == 0 {
+            out.push("tickets.days: must be above zero".to_string());
+        }
+        if self.tickets.per_device == 0 {
+            out.push("tickets.per_device: must be above zero".to_string());
+        }
+
         out
+    }
+
+    /// The file of the key that seals the pushes of a private server:
+    /// `gateway.key_file`, or `gateway.key` in the folder of the database.
+    /// `None` on a server that is not a private one.
+    pub fn gateway_key_path(&self) -> Option<PathBuf> {
+        self.gateway.url.as_ref()?;
+        Some(match &self.gateway.key_file {
+            Some(path) => path.clone(),
+            None => self
+                .store
+                .path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("gateway.key"),
+        })
     }
 
     /// Problems with the files the config names. Looked for when the config
@@ -487,6 +579,14 @@ impl Config {
                         "apps.{id}.apns.key_file: cannot read {}: {e}",
                         apns.key_file.display()
                     ));
+                }
+            }
+        }
+        // A missing key is made at the start; one that is there must be one.
+        if let Some(path) = self.gateway_key_path() {
+            if path.exists() {
+                if let Err(e) = crate::delivery::gateway::SealKey::read(&path) {
+                    out.push(format!("gateway.key_file: {e}"));
                 }
             }
         }
@@ -555,6 +655,22 @@ impl Config {
                 p.throttle_secs, p.device_cap, p.device_window_secs, p.call_cap, p.call_window_secs
             ),
         ));
+        if self.gateway.accept {
+            out.push((
+                "gateway".to_string(),
+                format!(
+                    "accept: tickets for {} days, {} a device",
+                    self.tickets.days, self.tickets.per_device
+                ),
+            ));
+        }
+        if let (Some(url), Some(key)) = (&self.gateway.url, self.gateway_key_path()) {
+            // The path of the key, never the key.
+            out.push((
+                "gateway".to_string(),
+                format!("wakes through {url}, sealed with the key of {}", key.display()),
+            ));
+        }
         out
     }
 
@@ -785,6 +901,100 @@ mod app_tests {
         for needle in ["not an app id", "must be an absolute path", "not an http(s) address"] {
             assert!(problems.contains(needle), "missing `{needle}` in:\n{problems}");
         }
+    }
+
+    #[test]
+    fn a_private_server_serves_its_apps_through_the_gateway_without_a_key_of_fcm() {
+        let c = Config::parse(
+            r#"
+            public_url = "https://push.my-server.example"
+            [apps."net.veydan.mobile"]
+            [gateway]
+            url = "https://eu-1-vpush.veydan.net"
+            "#,
+        )
+        .unwrap();
+        assert!(c.apps["net.veydan.mobile"].fcm.is_none());
+        assert!(!c.gateway.accept);
+        assert_eq!(c.gateway_key_path(), Some(PathBuf::from("/opt/vpush/data/gateway.key")));
+        let summary = c.summary();
+        assert!(summary.iter().any(|(k, v)| k == "gateway" && v.contains("eu-1-vpush")), "{summary:?}");
+
+        let c = Config::parse(
+            "public_url = \"https://push.example.org\"\n[gateway]\nurl = \"https://g.example.org\"\nkey_file = \"/k/seal.key\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.gateway_key_path(), Some(PathBuf::from("/k/seal.key")));
+        let plain = Config::parse(r#"public_url = "https://push.example.org""#).unwrap();
+        assert_eq!(plain.gateway_key_path(), None, "a server that is not a private one has no key");
+    }
+
+    #[test]
+    fn a_gateway_issues_tickets_for_so_long_and_so_many() {
+        let c = Config::parse("public_url = \"https://push.example.org\"\n[gateway]\naccept = true\n").unwrap();
+        assert!(c.gateway.accept);
+        assert_eq!((c.tickets.days, c.tickets.per_device), (30, 8));
+        let c = Config::parse(
+            "public_url = \"https://push.example.org\"\n[gateway]\naccept = true\n[tickets]\ndays = 7\nper_device = 2\n",
+        )
+        .unwrap();
+        assert_eq!((c.tickets.days, c.tickets.per_device), (7, 2));
+    }
+
+    #[test]
+    fn a_gateway_that_will_not_do_is_refused_with_every_reason() {
+        let problems = Config::parse(
+            r#"
+            public_url = "https://push.example.org"
+            [gateway]
+            accept = true
+            url = "http://gateway.example.org/"
+            key_file = "seal.key"
+            [tickets]
+            days = 0
+            per_device = 0
+            "#,
+        )
+        .unwrap_err()
+        .join("\n");
+        for needle in [
+            "gateway.url: http is accepted for localhost only",
+            "gateway.url: drop the trailing slash",
+            "`accept` and `url` together",
+            "gateway.key_file: `seal.key` must be an absolute path",
+            "tickets.days: must be above zero",
+            "tickets.per_device: must be above zero",
+        ] {
+            assert!(problems.contains(needle), "missing `{needle}` in:\n{problems}");
+        }
+        let problems = Config::parse(
+            "public_url = \"https://push.example.org\"\n[gateway]\nkey_file = \"/k/seal.key\"\n",
+        )
+        .unwrap_err();
+        assert!(problems[0].starts_with("gateway.key_file: a key seals"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_key_to_seal_with_that_is_not_one_is_found_when_loading_and_is_not_shown() {
+        let dir = std::env::temp_dir().join(format!("vpush-cfg-seal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, key) = (dir.join("vpush.toml"), dir.join("seal.key"));
+        std::fs::write(&key, "secret-of-the-server\n").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "public_url = \"https://push.example.org\"\n[gateway]\nurl = \"https://g.example.org\"\nkey_file = \"{}\"\n",
+                key.display()
+            ),
+        )
+        .unwrap();
+        let e = Config::load(&path).unwrap_err().to_string();
+        assert!(e.contains("gateway.key_file:") && e.contains("not a key"), "{e}");
+        assert!(!e.contains("secret-of"), "{e}");
+        // A missing one is made at the start, and is no problem here.
+        std::fs::remove_file(&key).unwrap();
+        Config::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

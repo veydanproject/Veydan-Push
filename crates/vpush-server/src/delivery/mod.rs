@@ -6,6 +6,7 @@
 //! mistake of ours must never cost a user their registration.
 
 pub mod fcm;
+pub mod gateway;
 pub mod http;
 pub mod retry;
 
@@ -28,6 +29,8 @@ pub enum ProviderKind {
     Fcm,
     Apns,
     Unifiedpush,
+    /// The gateway of a private push server, which wakes a ticket.
+    Gateway,
 }
 
 impl ProviderKind {
@@ -36,6 +39,7 @@ impl ProviderKind {
             Self::Fcm => "fcm",
             Self::Apns => "apns",
             Self::Unifiedpush => "unifiedpush",
+            Self::Gateway => "gateway",
         }
     }
 }
@@ -48,8 +52,9 @@ impl std::str::FromStr for ProviderKind {
             "fcm" => Ok(Self::Fcm),
             "apns" => Ok(Self::Apns),
             "unifiedpush" => Ok(Self::Unifiedpush),
+            "gateway" => Ok(Self::Gateway),
             other => Err(format!(
-                "`{other}` is not a provider (fcm, apns, unifiedpush)"
+                "`{other}` is not a provider (fcm, apns, unifiedpush, gateway)"
             )),
         }
     }
@@ -58,10 +63,23 @@ impl std::str::FromStr for ProviderKind {
 /// Where a push goes: what the device gave at registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
+    /// The address at the push service; the ticket, through the gateway.
     pub token: String,
+    /// The push key of the device, 64 hex characters, which every push to
+    /// it is sealed to: a device registered through the gateway has one,
+    /// every other none.
+    pub seal_to: Option<String>,
 }
 
 impl Target {
+    /// A device at a push service that takes the push as it is.
+    pub fn of(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+            seal_to: None,
+        }
+    }
+
     /// The token as it may appear in a log: enough to tell two apart, not
     /// enough to push with.
     pub fn masked(&self) -> String {
@@ -269,6 +287,8 @@ pub async fn test_push(provider: &dyn PushProvider, target: &Target, trace: &str
 #[derive(Default)]
 pub struct Providers {
     by_app: BTreeMap<String, BTreeMap<ProviderKind, Arc<dyn PushProvider>>>,
+    /// The gateway of a private push server, as `/v1/info` names it.
+    gateway: Option<vpush_proto::GatewayInfo>,
 }
 
 impl Providers {
@@ -281,7 +301,34 @@ impl Providers {
                 out.insert(app_id, Arc::new(client));
             }
         }
+        // A private server wakes the devices of every app it serves through
+        // its gateway; the key that seals the pushes is made at the first
+        // start.
+        if let (Some(url), Some(path)) = (&config.gateway.url, config.gateway_key_path()) {
+            let key = gateway::SealKey::read_or_make(&path)
+                .map_err(|e| anyhow::anyhow!("gateway.key_file: {e}"))?;
+            let client = Arc::new(
+                gateway::GatewayClient::new(url, Arc::new(key))
+                    .map_err(|e| anyhow::anyhow!("gateway: {e}"))?,
+            );
+            for app_id in config.apps.keys() {
+                out.insert_gateway(app_id, Arc::clone(&client));
+            }
+            out.gateway = Some(client.info());
+        }
         Ok(out)
+    }
+
+    /// The gateway as the push service of an app.
+    pub fn insert_gateway(&mut self, app_id: &str, client: Arc<gateway::GatewayClient>) {
+        self.gateway = Some(client.info());
+        self.insert(app_id, client);
+    }
+
+    /// The gateway this server wakes its devices through, when it is a
+    /// private one.
+    pub fn gateway(&self) -> Option<&vpush_proto::GatewayInfo> {
+        self.gateway.as_ref()
     }
 
     pub fn insert(&mut self, app_id: &str, provider: Arc<dyn PushProvider>) {
@@ -375,9 +422,7 @@ mod tests {
     }
 
     fn phone() -> Target {
-        Target {
-            token: "token-of-the-phone".into(),
-        }
+        Target::of("token-of-the-phone")
     }
 
     #[tokio::test(start_paused = true)]

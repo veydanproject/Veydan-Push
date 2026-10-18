@@ -370,7 +370,7 @@ async fn test_push(state: &AdminState, app: &str, kind: ProviderKind, token: Str
         Err(e) => return Response::err(e),
     };
     let trace = crate::api::next_request_id();
-    let target = Target { token };
+    let target = Target::of(token);
 
     let delivery = delivery::test_push(provider.as_ref(), &target, &trace).await;
     let last = delivery.attempts.last();
@@ -460,13 +460,13 @@ mod tests {
         let counters = Counters::default();
         counters.lines_started_over.add();
         let stats = Stats {
-            counts: Counts { devices: 3, owners: 2, dead_tokens: 1 },
+            counts: Counts { devices: 3, owners: 2, dead_tokens: 1, tickets: 4 },
             since_start: &counters,
         };
         assert_eq!(
             serde_json::to_value(stats).unwrap(),
             serde_json::json!({
-                "devices": 3, "owners": 2, "dead_tokens": 1,
+                "devices": 3, "owners": 2, "dead_tokens": 1, "tickets": 4,
                 "since_start": {
                     "refused_rate_owner": 0, "refused_rate_ip": 0,
                     "refused_devices_total": 0, "tokens_invalid": 0, "refused_denied": 0,
@@ -499,6 +499,7 @@ mod tests {
             last_push_at: None,
             last_outcome: None,
             token_checked_at: None,
+            seal_to: None,
             relays: vec![],
             groups: vec![group("11", &["c1", "c0"]), group("22", &["c1"]), group("33", &[])],
         };

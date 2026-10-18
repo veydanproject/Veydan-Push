@@ -1,6 +1,7 @@
 //! Public HTTP API.
 
 mod devices;
+pub mod tickets;
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,17 +12,17 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use tower_http::timeout::TimeoutLayer;
 use vpush_proto::denied::{DeniedKeys, Refreshed, RELOAD_EVERY};
-use vpush_proto::{AppInfo, ErrorBody, ErrorCode, ErrorDetail, Info, Limits};
+use vpush_proto::{AppInfo, ErrorBody, ErrorCode, ErrorDetail, Info, Limits, TicketsInfo};
 
 use crate::auth::Nip98;
 use crate::config::Config;
 use crate::counters::Counters;
 use crate::delivery::Providers;
-use crate::limit::Limiter;
+use crate::limit::{Budget, Limiter, Over};
 use crate::relays::RelayPolicy;
 use crate::store::Store;
 use crate::version;
@@ -112,6 +113,33 @@ pub const REQUESTS_PER_MINUTE: usize = 120;
 /// in an hour. Each of them costs a question to the push service and a row.
 pub const NEW_DEVICES_PER_HOUR: usize = 20;
 
+/// Wakes of one ticket a minute (`spec/protocol.md`, "The wake"): a device is
+/// pushed to at most thirty times a minute by any server, and this is the
+/// most the gateway learns of the traffic of a ticket.
+pub const WAKES_PER_MINUTE: usize = 30;
+
+/// Wakes of one device a minute, summed over all its tickets: a device
+/// holds up to eight, each handed to a server that may be hostile, and
+/// together they wake it no more often than one ticket may.
+pub const DEVICE_WAKES_PER_MINUTE: usize = 30;
+
+/// Wakes of one device an hour, summed over all its tickets.
+pub const DEVICE_WAKES_PER_HOUR: usize = 300;
+
+/// Urgent wakes (a call) of one device a minute, summed over all its
+/// tickets. They have a budget of their own, beside the one above and not
+/// in it: a flood of ordinary wakes from one server never silences a call
+/// from another.
+pub const DEVICE_URGENT_WAKES_PER_MINUTE: usize = 20;
+
+/// Urgent wakes of one device an hour, summed over all its tickets.
+pub const DEVICE_URGENT_WAKES_PER_HOUR: usize = 120;
+
+/// Wakes one address may ask for a minute, whatever the ticket, answered
+/// or not: each costs a hash and a question to the database. Generous, as
+/// a private push server sends the wakes of all its users from one.
+pub const WAKE_REQUESTS_PER_MINUTE: usize = 600;
+
 /// How often what may be asked.
 pub struct Limiters {
     /// Test pushes, by the token they go to. A token is one phone, whatever
@@ -125,6 +153,17 @@ pub struct Limiters {
     new_devices: Limiter<IpAddr>,
     /// Every request to a device, by the address it came from.
     requests: Limiter<IpAddr>,
+    /// Wakes, by the hash of their ticket.
+    wakes: Limiter<String>,
+    /// Ordinary wakes, by the device woken: the hash of its token, as for
+    /// `tests`.
+    device_wakes: Budget<[u8; 32]>,
+    /// Urgent wakes, by the device woken, counted apart from the others.
+    device_urgent_wakes: Budget<[u8; 32]>,
+    /// Every request to wake, by the address it came from. A private push
+    /// server wakes the devices of all its users from one, so the room is
+    /// wide; it is there for the one who tries tickets at random.
+    wake_requests: Limiter<IpAddr>,
 }
 
 impl Limiters {
@@ -140,17 +179,25 @@ impl Limiters {
             puts: Limiter::new(Self::MINUTE, PUTS_PER_MINUTE, Self::MAX_KEYS),
             new_devices: Limiter::new(Self::HOUR, NEW_DEVICES_PER_HOUR, Self::MAX_KEYS),
             requests: Limiter::new(Self::MINUTE, REQUESTS_PER_MINUTE, Self::MAX_KEYS),
+            wakes: Limiter::new(Self::MINUTE, WAKES_PER_MINUTE, Self::MAX_KEYS),
+            device_wakes: Budget::new(
+                (Self::MINUTE, DEVICE_WAKES_PER_MINUTE),
+                (Self::HOUR, DEVICE_WAKES_PER_HOUR),
+                Self::MAX_KEYS,
+            ),
+            device_urgent_wakes: Budget::new(
+                (Self::MINUTE, DEVICE_URGENT_WAKES_PER_MINUTE),
+                (Self::HOUR, DEVICE_URGENT_WAKES_PER_HOUR),
+                Self::MAX_KEYS,
+            ),
+            wake_requests: Limiter::new(Self::MINUTE, WAKE_REQUESTS_PER_MINUTE, Self::MAX_KEYS),
         }
     }
 
     /// Counts one more test push to the token, or says after how long to
     /// come back.
     pub fn test(&self, token: &str) -> Result<(), Duration> {
-        // Remembered by its hash: a token may be thousands of bytes long.
-        let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
-        let mut key = [0u8; 32];
-        key.copy_from_slice(digest.as_ref());
-        self.tests.take(key)
+        self.tests.take(token_key(token))
     }
 
     /// Counts one more registration of the owner.
@@ -167,6 +214,41 @@ impl Limiters {
     pub fn new_device(&self, from: IpAddr) -> Result<(), Duration> {
         self.new_devices.take(network(from))
     }
+
+    /// Counts one more wake of the ticket of this hash.
+    pub fn wake(&self, ticket_hash: &str) -> Result<(), Duration> {
+        self.wakes.take(ticket_hash.to_string())
+    }
+
+    /// Counts one more wake of the device of this token, whichever of its
+    /// tickets it came by, or says which window is full. An urgent wake is
+    /// counted in the urgent budget alone, and refused only when that one
+    /// is spent.
+    pub fn device_wake(&self, token: &str, urgent: bool) -> Result<(), Over> {
+        self.device_wake_at(token, urgent, Instant::now())
+    }
+
+    fn device_wake_at(&self, token: &str, urgent: bool, now: Instant) -> Result<(), Over> {
+        let budget = if urgent {
+            &self.device_urgent_wakes
+        } else {
+            &self.device_wakes
+        };
+        budget.take_at(token_key(token), now)
+    }
+
+    /// Counts one more request to wake from the address.
+    pub fn wake_request(&self, from: IpAddr) -> Result<(), Duration> {
+        self.wake_requests.take(network(from))
+    }
+}
+
+/// A token remembered by its hash: it may be thousands of bytes long.
+fn token_key(token: &str) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, token.as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(digest.as_ref());
+    key
 }
 
 /// What is counted as one client. An IPv6 address is counted by its first
@@ -187,14 +269,23 @@ fn network(address: IpAddr) -> IpAddr {
 
 pub fn router(api: Api) -> Router {
     let config = api.config.clone();
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/info", get(info))
         .route(
             "/v1/devices/{device_id}",
             put(devices::put).get(devices::get).delete(devices::delete),
         )
-        .route("/v1/devices/{device_id}/test", post(devices::test))
+        .route("/v1/devices/{device_id}/test", post(devices::test));
+    // Only a gateway issues tickets and wakes them; to every other server
+    // they are routes it does not have.
+    if config.gateway.accept {
+        router = router
+            .route("/v1/tickets", post(tickets::issue).get(tickets::list))
+            .route("/v1/tickets/{ticket}", delete(tickets::delete))
+            .route("/v1/gateway/wake", post(tickets::wake));
+    }
+    router
         .fallback(not_found)
         .with_state(api)
         .layer(DefaultBodyLimit::max(config.server.max_body_bytes))
@@ -234,6 +325,11 @@ async fn info(State(api): State<Api>) -> Json<Info> {
             test_per_hour: limits.test_per_hour,
             max_body_bytes: api.config.server.max_body_bytes as u32,
         },
+        gateway: api.providers.gateway().cloned(),
+        tickets: api.config.gateway.accept.then_some(TicketsInfo {
+            days: api.config.tickets.days,
+            per_device: api.config.tickets.per_device,
+        }),
     })
 }
 
@@ -280,11 +376,23 @@ pub fn next_request_id() -> String {
     format!("{:08x}", (mixed >> 32) as u32)
 }
 
+/// The path as the log writes it. A ticket in the path of its removal is cut
+/// to its first 8 hex: whoever reads the log cannot wake with it.
+fn shown_path(path: &str) -> String {
+    match path.strip_prefix("/v1/tickets/") {
+        Some(ticket) if ticket.len() > 8 => {
+            let cut = (0..=8).rev().find(|i| ticket.is_char_boundary(*i)).unwrap_or(0);
+            format!("/v1/tickets/{}…", &ticket[..cut])
+        }
+        _ => path.to_string(),
+    }
+}
+
 /// One INFO line per request, and the request id on the way in and out.
 async fn access_log(mut request: Request, next: Next) -> Response {
     let id = next_request_id();
     let method = request.method().clone();
-    let path = request.uri().path().to_string();
+    let path = shown_path(request.uri().path());
     request.extensions_mut().insert(RequestId(id.clone()));
 
     let started = Instant::now();
@@ -308,6 +416,16 @@ async fn access_log(mut request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ticket_in_a_path_is_logged_by_its_first_8_hex() {
+        let ticket = "7a".repeat(32);
+        assert_eq!(shown_path(&format!("/v1/tickets/{ticket}")), "/v1/tickets/7a7a7a7a…");
+        for kept in ["/v1/tickets", "/v1/tickets/7a7a7a7a", "/v1/devices/phone-0001", "/v1/gateway/wake"] {
+            assert_eq!(shown_path(kept), kept);
+        }
+        assert_eq!(shown_path("/v1/tickets/жжжжжж"), "/v1/tickets/жжжж…");
+    }
 
     #[test]
     fn the_test_limit_is_per_token() {
@@ -367,5 +485,65 @@ mod tests {
         }
         assert!(from("2001:db8:1:2:ffff:ffff:ffff:ffff").is_err());
         from("2001:db8:1:3::1").unwrap();
+    }
+
+    #[test]
+    fn wakes_are_counted_by_the_address_and_by_the_device() {
+        let limits = Limiters::new(3);
+        let from = |address: &str| limits.wake_request(address.parse().unwrap());
+        for _ in 0..WAKE_REQUESTS_PER_MINUTE {
+            from("203.0.113.7").unwrap();
+        }
+        let wait = from("203.0.113.7").unwrap_err();
+        assert!(wait <= Limiters::MINUTE && wait > Duration::from_secs(50), "{wait:?}");
+        assert!(from("::ffff:203.0.113.7").is_err());
+        from("203.0.113.8").unwrap();
+        // A request to wake is not one to the devices: each has its own room.
+        limits.request("203.0.113.7".parse().unwrap()).unwrap();
+
+        for _ in 0..DEVICE_WAKES_PER_MINUTE {
+            limits.device_wake("token-of-the-phone", false).unwrap();
+        }
+        assert!(matches!(
+            limits.device_wake("token-of-the-phone", false),
+            Err(Over::Short(wait)) if wait <= Limiters::MINUTE && wait > Duration::from_secs(50)
+        ));
+        limits.device_wake("token-of-the-tablet", false).unwrap();
+    }
+
+    /// One hostile server spends the ordinary hour of a device in ten
+    /// minutes; a call from another still rings, within a budget of its own.
+    #[test]
+    fn a_flood_of_ordinary_wakes_never_silences_a_call() {
+        let limits = Limiters::new(3);
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let phone = "token-of-the-phone";
+        for minute in 0..(DEVICE_WAKES_PER_HOUR / DEVICE_WAKES_PER_MINUTE) as u64 {
+            for i in 0..DEVICE_WAKES_PER_MINUTE as u64 {
+                limits.device_wake_at(phone, false, at(minute * 60 + i)).unwrap();
+            }
+        }
+        let late = at(11 * 60);
+        assert!(
+            matches!(limits.device_wake_at(phone, false, late), Err(Over::Long(_))),
+            "{DEVICE_WAKES_PER_HOUR} ordinary wakes in the hour"
+        );
+        // The urgent budget is untouched, and has limits of its own.
+        for _ in 0..DEVICE_URGENT_WAKES_PER_MINUTE {
+            limits.device_wake_at(phone, true, late).unwrap();
+        }
+        assert!(matches!(limits.device_wake_at(phone, true, late), Err(Over::Short(_))));
+        // Urgent wakes are not counted in the ordinary budget: they fill
+        // their own hour and no more.
+        for minute in 12..(12 + 5) {
+            for _ in 0..DEVICE_URGENT_WAKES_PER_MINUTE {
+                limits.device_wake_at(phone, true, at(minute * 60)).unwrap();
+            }
+        }
+        assert!(matches!(
+            limits.device_wake_at(phone, true, at(18 * 60)),
+            Err(Over::Long(_))
+        ));
     }
 }

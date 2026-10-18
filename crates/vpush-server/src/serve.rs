@@ -132,7 +132,8 @@ pub async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Once an hour, forgets the registrations nobody renewed.
+/// Once an hour, forgets the registrations nobody renewed, and the tickets
+/// that ran out (the tickets of a device that goes go with it).
 async fn forget_expired(store: Arc<dyn Store>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
     loop {
@@ -141,6 +142,11 @@ async fn forget_expired(store: Arc<dyn Store>) {
             Ok(0) => {}
             Ok(n) => tracing::info!(devices = n, "expired registrations forgotten"),
             Err(e) => tracing::error!(error = %e, "cannot forget expired registrations"),
+        }
+        match store.purge_tickets(api::now()).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(tickets = n, "expired tickets forgotten"),
+            Err(e) => tracing::error!(error = %e, "cannot forget expired tickets"),
         }
     }
 }

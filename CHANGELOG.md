@@ -3,6 +3,56 @@
 Versions of VPush are its own and do not follow the app. Tags are
 `v<version>`.
 
+## 0.5.0 — the gateway: a push for a server of one's own
+
+- The gateway (`spec/protocol.md`, "The gateway"): a push for a server of
+  one's own. A push server of the network with `[gateway] accept = true`
+  issues tickets for the tokens of its devices (`POST`, `GET`, `DELETE
+  /v1/tickets`, signed as `/v1/devices`; 32 random bytes, `tickets.days`
+  30, `tickets.per_device` 8, kept as their SHA-256 and first 8 hex,
+  gone with their device and with its dead token, the ones that ran out
+  swept once an hour) and wakes them for a private push server
+  (`POST /v1/gateway/wake`, no signature: `404 ticket_unknown`, `413`,
+  `429` after 30 a minute per ticket, then one attempt at FCM with the
+  `data` type `sealed` — `blob`, `sender`, `trace` — answered `202`, `404
+  ticket_unknown` for a dead token, `503 provider_unavailable` or `502
+  provider_rejected`). Its log of a wake: the trace, the ticket's first 8
+  hex, the size, the outcome. `/v1/info` says `tickets`; `vpush ctl stats`
+  counts them.
+- The wake counted by the device as well as by the ticket: 30 a minute
+  and 300 an hour per device, summed over all its tickets, so eight
+  tickets in hostile hands wake a phone no more often than one; urgent
+  wakes (a call) in a budget of their own, 20 a minute and 120 an hour per
+  device, so a flood of ordinary wakes never silences a call; and by the
+  address, 600 requests to wake a minute (behind `trusted_proxy`), before a
+  random ticket costs a hash and a query. All `429 rate_limited`.
+- `Wake.urgent` (optional, `false` when absent; `golden/wake_urgent.json`):
+  the gateway sends at high priority only an urgent wake, and a private
+  push server asks for one only for the push of a call (`call` inside);
+  every other wake goes at normal priority.
+- What the gateway learns, said as it is: the token, the identity that
+  took the ticket, the address and seal key of the private server that
+  wakes it, the times, the size and whether a wake is urgent; not the
+  sender, the chat, the kind or the content (blind tickets, which would
+  hide which identity uses which private server, are not built).
+- A private push server (`[gateway] url`, `key_file` made at the first
+  start) registers devices with the channel `gateway` (ticket and push
+  key), seals every push — the `data` map FCM would have carried, NIP-44
+  v2 from its key to the push key, base64url — and hands it to the
+  gateway; a push over 3600 sealed goes by `event_id` and `relay`, a lost
+  ticket is a dead token, `429` and `503` are tried again, the ticket is
+  checked at registration with a sealed `test` push marked `check`
+  (`"1"`), which the device shows nothing for (`Payload.check`). No key of FCM is
+  needed: an app is named without one. `/v1/info` says `"providers":
+  ["gateway"]` and `gateway: { url, sender }`.
+- Migrations 006 (the table of devices made again, for the provider
+  `gateway`; a release before this one runs on it) and 007 (tickets).
+- `vpush-proto`: `Channel::Gateway`, `PushType::Sealed` with `blob` and
+  `sender`, the bodies of the tickets and the wake, `Info.gateway` and
+  `Info.tickets`, the codes `no_device`, `ticket_unknown`,
+  `provider_unavailable`, `provider_rejected`; examples of all in
+  `golden/`. `spec/operations.md`, "The gateway".
+
 ## 0.4.0 — the invitation to a call
 
 - The release carries VGuard: `vguard-linux-x86_64` and

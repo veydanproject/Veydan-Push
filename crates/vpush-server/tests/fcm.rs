@@ -68,9 +68,7 @@ fn sent_ok() -> ResponseTemplate {
 }
 
 fn target() -> Target {
-    Target {
-        token: "device-token".to_string(),
-    }
+    Target::of("device-token")
 }
 
 fn message() -> Message {

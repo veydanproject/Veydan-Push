@@ -6,7 +6,7 @@ wakes their devices when something arrives for them.
 The server never sees message contents. It sees that an encrypted event
 addressed to a user appeared on a relay, and tells the user's device.
 
-**State: 0.4.0.** Devices register, relays are watched, and a message on a
+**State: 0.5.0.** Devices register, relays are watched, and a message on a
 relay becomes a push through FCM that the phone opens itself. What is
 ahead: commands of the admin by direct message, UnifiedPush.
 

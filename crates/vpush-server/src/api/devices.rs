@@ -33,15 +33,15 @@ const MAX_TOKEN: usize = 4096;
 const REAL_IP: &str = "x-real-ip";
 
 /// A refusal, on its way to become an answer.
-struct Refusal {
-    status: StatusCode,
-    code: ErrorCode,
-    message: String,
-    retry_after: Option<Duration>,
+pub(super) struct Refusal {
+    pub(super) status: StatusCode,
+    pub(super) code: ErrorCode,
+    pub(super) message: String,
+    pub(super) retry_after: Option<Duration>,
 }
 
 impl Refusal {
-    fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
+    pub(super) fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status,
             code,
@@ -50,11 +50,11 @@ impl Refusal {
         }
     }
 
-    fn bad(message: impl Into<String>) -> Self {
+    pub(super) fn bad(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::BadRequest, message)
     }
 
-    fn too_often(message: impl Into<String>, wait: Duration) -> Self {
+    pub(super) fn too_often(message: impl Into<String>, wait: Duration) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
             code: ErrorCode::RateLimited,
@@ -63,7 +63,7 @@ impl Refusal {
         }
     }
 
-    fn internal(e: impl std::fmt::Display, request_id: &str) -> Self {
+    pub(super) fn internal(e: impl std::fmt::Display, request_id: &str) -> Self {
         // What went wrong inside is for the log, not for the one who asked.
         tracing::error!(request_id, error = %e, "request failed");
         Self::new(
@@ -73,7 +73,7 @@ impl Refusal {
         )
     }
 
-    fn answer(self, request_id: &str) -> Response {
+    pub(super) fn answer(self, request_id: &str) -> Response {
         let mut response = error(self.status, self.code, self.message, request_id.to_string());
         if let Some(after) = self.retry_after {
             if let Ok(value) = HeaderValue::from_str(&after.as_secs().max(1).to_string()) {
@@ -125,14 +125,14 @@ struct Asked {
     body: Bytes,
 }
 
-fn device_id_ok(id: &str) -> bool {
+pub(super) fn device_id_ok(id: &str) -> bool {
     (8..=64).contains(&id.len())
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-fn is_hex64(s: &str) -> bool {
+pub(super) fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
@@ -144,6 +144,37 @@ fn asked(
     device_id: String,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Asked, Refusal> {
+    let Signed { pubkey, event, body } =
+        signed(api, method, uri, headers, Some(&device_id), body)?;
+    Ok(Asked {
+        pubkey,
+        event,
+        device_id,
+        body,
+    })
+}
+
+/// A request signed by a key, as every request of `/v1/devices` and
+/// `/v1/tickets` is.
+pub(super) struct Signed {
+    /// The key that signed: the owner.
+    pub(super) pubkey: String,
+    /// The id of the signed event, not yet remembered as used.
+    pub(super) event: [u8; 32],
+    pub(super) body: Bytes,
+}
+
+/// What every signed request starts with: the body, the pace of its
+/// address, the device it names when it names one, the signature, and the
+/// key that signed among the denied ones.
+pub(super) fn signed(
+    api: &Api,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    device_id: Option<&str>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Signed, Refusal> {
     let body = body.map_err(|e| {
         let too_large = e.status() == StatusCode::PAYLOAD_TOO_LARGE;
         Refusal::new(
@@ -167,7 +198,7 @@ fn asked(
             )
         })?;
     }
-    if !device_id_ok(&device_id) {
+    if device_id.is_some_and(|id| !device_id_ok(id)) {
         return Err(Refusal::bad(
             "the device id is 8 to 64 letters, digits, `_` or `-`",
         ));
@@ -196,10 +227,9 @@ fn asked(
             "the key is denied on the servers of Veydan",
         ));
     }
-    Ok(Asked {
+    Ok(Signed {
         pubkey: verified.pubkey,
         event: verified.event,
-        device_id,
         body,
     })
 }
@@ -282,7 +312,7 @@ fn watched_groups(named: Vec<GroupWatch>) -> Result<Vec<WatchedGroup>, Refusal> 
 /// Whom a request came from, as the reverse proxy in front says. `None`
 /// when there is no proxy to say it: what a client writes into a header is
 /// no address.
-fn client(api: &Api, headers: &HeaderMap) -> Option<IpAddr> {
+pub(super) fn client(api: &Api, headers: &HeaderMap) -> Option<IpAddr> {
     if !api.config.server.trusted_proxy {
         return None;
     }
@@ -304,6 +334,8 @@ struct Accepted {
     relays: Vec<RelayAnswer>,
     /// The service that pushes to the device.
     provider: Arc<dyn PushProvider>,
+    /// The push key of a device registered through the gateway.
+    seal_to: Option<String>,
 }
 
 fn accepted(api: &Api, asked: &Asked, put: DevicePut) -> Result<Accepted, Refusal> {
@@ -339,6 +371,24 @@ fn accepted(api: &Api, asked: &Asked, put: DevicePut) -> Result<Accepted, Refusa
             endpoint.clone(),
             Some(serde_json::to_string(&put.channel).unwrap_or_default()),
         ),
+        // The ticket is the address of the device here, as a token is
+        // elsewhere: one ticket, one device. The push key is kept beside it.
+        Channel::Gateway { ticket, pubkey } => {
+            if !is_hex64(ticket) {
+                return Err(Refusal::bad("a ticket is 64 hex characters"));
+            }
+            if !is_hex64(pubkey) || nostr::key::PublicKey::from_hex(pubkey).and_then(|key| key.xonly()).is_err() {
+                return Err(Refusal::bad("the push key is 64 hex characters of a public key"));
+            }
+            (
+                ticket.clone(),
+                Some(serde_json::to_string(&put.channel).unwrap_or_default()),
+            )
+        }
+    };
+    let seal_to = match &put.channel {
+        Channel::Gateway { pubkey, .. } => Some(pubkey.clone()),
+        _ => None,
     };
     if token.trim().is_empty() || token.len() > MAX_TOKEN {
         return Err(Refusal::bad("the token is empty or too long"));
@@ -412,6 +462,7 @@ fn accepted(api: &Api, asked: &Asked, put: DevicePut) -> Result<Accepted, Refusa
         input,
         relays: answers,
         provider,
+        seal_to,
     })
 }
 
@@ -477,6 +528,7 @@ pub async fn put(
             mut input,
             relays,
             provider,
+            seal_to,
         } = accepted(&api, &asked, put)?;
         remembered(&api, &asked)?;
 
@@ -515,6 +567,7 @@ pub async fn put(
         } else {
             let target = Target {
                 token: input.token.clone(),
+                seal_to,
             };
             Some(check_token(provider.as_ref(), &target).await)
         };
@@ -701,6 +754,7 @@ pub async fn test(
 
         let target = Target {
             token: device.token.clone(),
+            seal_to: device.seal_to.clone(),
         };
         let delivery = test_push(provider.as_ref(), &target, &rid).await;
         let outcome = outcome_name(delivery.outcome);

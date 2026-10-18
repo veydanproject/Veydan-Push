@@ -566,7 +566,10 @@ impl Pipeline {
                 return;
             };
             let Parcel { trace, kind, relay, to, count, message } = parcel;
-            let target = Target { token: to.token.clone() };
+            let target = Target {
+                token: to.token.clone(),
+                seal_to: to.seal_to.clone(),
+            };
             let provider = to
                 .provider
                 .parse::<ProviderKind>()

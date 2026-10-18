@@ -224,6 +224,8 @@ binary before it switches.
 | `log.targets` | empty | Level per module or crate |
 | `denied_keys_file` | `denied-keys.txt` beside `store.path` | The keys denied on every server of the network, one 64-hex key a line, `#` a comment; laid by the agent of vcloud (its helper, as a file of the `paths` of the component `vpush`) and looked at again once a minute. No file, nobody denied. A top-level key: it goes above every table of the file |
 
+The keys of the gateway (`gateway.*`, `tickets.*`) are in "The gateway".
+
 An unknown key is an error. So is a value of the wrong type.
 
 ## Signals
@@ -260,6 +262,93 @@ missing or is not a service account stops the start, with the reason.
 | `apps.<id>.apns.*` | Read and checked; delivery to iOS is not built yet |
 
 After a change: `systemctl restart vpush`.
+
+## The gateway
+
+A private server (the kit of `services/server`) cannot push to the apps of
+Veydan by itself: their tokens belong to the Firebase project of Veydan. A
+push server of the network can wake them on its behalf, as the **gateway**
+(`spec/protocol.md`, "The gateway"). A server is a gateway, or wakes its
+devices through one, or neither; never both.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `gateway.accept` | `false` | This server is a gateway: it issues tickets (`/v1/tickets`) for the tokens of its devices and wakes them (`/v1/gateway/wake`) |
+| `tickets.days` | `30` | How long a ticket lives |
+| `tickets.per_device` | `8` | Live tickets a device holds; the oldest goes when one more is asked for |
+| `gateway.url` | none | This server is a private one: its devices are registered with a ticket of this gateway and are woken through it. `https`, no trailing slash |
+| `gateway.key_file` | `gateway.key` beside `store.path` | With `gateway.url`: the key that seals every push, 64 hex characters. Made at the first start when missing (mode 0600); `check-config` refuses a file that is not a key |
+
+A server of the network that is a gateway, with the key of FCM of the app:
+
+```toml
+[apps."net.veydan.mobile".fcm]
+service_account = "/opt/vpush/etc/secrets/fcm-veydan.json"
+
+[gateway]
+accept = true
+
+[tickets]
+days = 30
+per_device = 8
+```
+
+A private server, as the kit writes it with `PUSH_GATEWAY=veydan`: the apps
+are named without a key of FCM, and every one of them is served through the
+gateway (`/v1/info` says `"providers": ["gateway"]`, and `gateway.url` with
+the public half of the key as `gateway.sender`):
+
+```toml
+[apps."net.veydan.mobile"]
+[apps."net.veydan.chat"]
+
+[gateway]
+url = "https://eu-1-vpush.veydan.net"
+key_file = "/opt/vpush/data/gateway.key"
+```
+
+An app with a key of FCM of its own may be named beside them, as above: its
+devices choose FCM or the gateway when they register.
+
+The key of a private server is in no backup of the database. Lost, a new
+one is made at the next start and `/v1/info` names it: a device that reads
+`gateway.sender` again opens the pushes, one that does not drops them until
+it does.
+
+What the gateway keeps of a ticket is its SHA-256 and its first 8 hex: a
+copy of the database wakes nobody. Of a wake, the log has one line:
+
+```
+INFO wake request_id=5f3a9c1e trace=5f3a9c1e ticket=7a4e2c1f bytes=431 outcome=delivered http_status=200
+```
+
+the trace, the first 8 hex of the ticket, the size, and what FCM said;
+nothing of the device or of its owner. The path of `DELETE
+/v1/tickets/{ticket}` is written with the ticket cut to its first 8 hex.
+`vpush ctl stats` counts the tickets (`tickets`). The log is not all the
+gateway could know: the database ties a ticket to its device and so to its
+owner, and the proxy in front logs the address of the private server a
+wake comes from (`spec/protocol.md`, "What the gateway learns").
+
+A wake goes to FCM at high priority only when it says `urgent`, which a
+private push server says for the push of a call alone; every other wake
+goes at normal priority.
+
+On a private server a push to a device of the gateway is logged as any
+other (`push`, with the ticket as its `token` mark). Its codes, besides
+those of a push service:
+
+| `code` | Outcome | Cause |
+|---|---|---|
+| `ticket_unknown` | `dead_token` | The gateway knows no such ticket: expired, deleted, or its token is dead. The device is not pushed to until it registers with a new ticket |
+| `rate_limited`, `provider_unavailable` | `retry` | The gateway, or FCM behind it, says to come back later |
+| `provider_rejected` | `rejected` | FCM refused the push the gateway handed it |
+| `TOO_BIG` | `rejected` | Sealed, even the push without the event is over 3600 bytes |
+| `NO_PUSH_KEY` | `rejected` | The device registered no push key that is one |
+| `UNREACHABLE` | `retry` | No connection to the gateway from this server |
+
+A bare `404` of the gateway (a wrong `gateway.url`) is `rejected`, never
+`dead_token`: a mistake in the config costs no device its registration.
 
 ## Does a push arrive
 
@@ -385,13 +474,17 @@ After a change: `systemctl restart vpush`.
 | `limits.test_per_hour` | 3 | Test pushes a device may ask for in an hour. Counted by its token: the same phone under a new `device_id` gets no more |
 | `limits.devices_total` | 100000 | Devices of all owners together. A registration that would be one more is refused with `limit_devices_total`; those who are registered renew as before |
 
-Two more limits are not in the config:
+More limits are not in the config:
 
 | What | How often | Refused with |
 |---|---|---|
 | Registrations (`PUT`) of one owner | 10 in a minute | `rate_limited` |
 | New devices from one address | 20 in an hour, when `server.trusted_proxy` is on | `rate_limited` |
 | Any request to `/v1/devices` from one address | 120 in a minute, when `server.trusted_proxy` is on | `rate_limited` |
+| Wakes of one ticket (a gateway) | 30 in a minute | `rate_limited` |
+| Wakes of one device, by all its tickets (a gateway) | 30 in a minute and 300 in an hour, urgent wakes not counted | `rate_limited` |
+| Urgent wakes (a call) of one device, by all its tickets (a gateway) | 20 in a minute and 120 in an hour, apart from the others: a flood of ordinary wakes never silences a call | `rate_limited` |
+| Any request to `/v1/gateway/wake` from one address (a gateway) | 600 in a minute, when `server.trusted_proxy` is on | `rate_limited` |
 
 A new device is a `device_id` its owner has not registered, or another
 token for one that is: each costs a question to the push service and, when

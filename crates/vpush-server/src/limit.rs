@@ -1,6 +1,7 @@
 //! What happened a moment ago, counted by key: the signatures that were
 //! used, the test pushes that were asked for, the registrations of an owner
-//! and of an address.
+//! and of an address, the wakes of a ticket, of a device and from an
+//! address.
 //!
 //! Whoever can make the server remember a thing can ask it to remember a
 //! million of them. So the count is kept for a bounded number of keys, and
@@ -55,13 +56,21 @@ impl<K: Hash + Eq + Clone> Recent<K> {
 
     /// Counts one more take of `key`, or says why not.
     pub fn take(&mut self, key: K, now: Instant) -> Result<(), Refused> {
+        self.room(&key, now)?;
+        self.by_key.entry(key.clone()).or_default().push_back(now);
+        self.order.push_back((now, key));
+        Ok(())
+    }
+
+    /// Whether `key` could be taken now, counting nothing.
+    fn room(&mut self, key: &K, now: Instant) -> Result<(), Refused> {
         self.forget(now);
         // Until the take made at `since` leaves the window.
         let wait = |since: Option<&Instant>| match since {
             Some(at) => self.window.saturating_sub(now.duration_since(*at)),
             None => self.window,
         };
-        let taken = self.by_key.get(&key);
+        let taken = self.by_key.get(key);
         if taken.map_or(0, VecDeque::len) >= self.per_key {
             return Err(Refused::TooOften(wait(taken.and_then(VecDeque::front))));
         }
@@ -69,8 +78,6 @@ impl<K: Hash + Eq + Clone> Recent<K> {
             let oldest = self.order.front().map(|(at, _)| at);
             return Err(Refused::Full(wait(oldest)));
         }
-        self.by_key.entry(key.clone()).or_default().push_back(now);
-        self.order.push_back((now, key));
         Ok(())
     }
 
@@ -111,6 +118,60 @@ impl<K: Hash + Eq + Clone> Limiter<K> {
             .unwrap()
             .take(key, Instant::now())
             .map_err(Refused::wait)
+    }
+}
+
+/// Which of the two windows of a [`Budget`] has no room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Over {
+    Short(Duration),
+    Long(Duration),
+}
+
+impl Over {
+    pub fn wait(self) -> Duration {
+        match self {
+            Self::Short(wait) | Self::Long(wait) => wait,
+        }
+    }
+}
+
+/// A key counted in two windows at once, a short one and a long one: so
+/// many a minute, and fewer an hour than sixty minutes of that. A take is
+/// counted in both or in neither, so what one window refuses costs nothing
+/// in the other.
+pub struct Budget<K> {
+    windows: Mutex<(Recent<K>, Recent<K>)>,
+}
+
+impl<K: Hash + Eq + Clone> Budget<K> {
+    /// `short` and `long` are each a window and how often a key may be
+    /// taken within it.
+    pub fn new(short: (Duration, usize), long: (Duration, usize), max_keys: usize) -> Self {
+        Self {
+            windows: Mutex::new((
+                Recent::new(short.0, short.1, max_keys),
+                Recent::new(long.0, long.1, max_keys),
+            )),
+        }
+    }
+
+    /// Counts one more take of `key`, or says which window has no room and
+    /// after how long to come back.
+    pub fn take(&self, key: K) -> Result<(), Over> {
+        self.take_at(key, Instant::now())
+    }
+
+    /// As [`Budget::take`], by a clock of the caller's.
+    pub(crate) fn take_at(&self, key: K, now: Instant) -> Result<(), Over> {
+        let mut windows = self.windows.lock().unwrap();
+        let (short, long) = &mut *windows;
+        short.room(&key, now).map_err(|r| Over::Short(r.wait()))?;
+        long.room(&key, now).map_err(|r| Over::Long(r.wait()))?;
+        // Both have room, so neither take is refused.
+        let _ = short.take(key.clone(), now);
+        let _ = long.take(key, now);
+        Ok(())
     }
 }
 
@@ -178,6 +239,30 @@ mod tests {
         let wait = limiter.take("a").unwrap_err();
         assert!(wait <= HOUR && wait > secs(3590), "{wait:?}");
         limiter.take("b").unwrap();
+    }
+
+    #[test]
+    fn a_budget_counts_a_minute_and_an_hour_and_a_refusal_costs_nothing() {
+        let start = Instant::now();
+        let budget = Budget::new((secs(60), 3), (HOUR, 5), 100);
+        for i in 0..3 {
+            budget.take_at("a", start + secs(i)).unwrap();
+        }
+        assert_eq!(budget.take_at("a", start + secs(10)), Err(Over::Short(secs(50))));
+        // Refused by the minute, a take is not counted in the hour: two
+        // more fit once the minute has room again.
+        for i in 0..100 {
+            assert!(budget.take_at("a", start + secs(20) + Duration::from_millis(i)).is_err());
+        }
+        budget.take_at("a", start + secs(61)).unwrap();
+        budget.take_at("a", start + secs(62)).unwrap();
+        assert_eq!(
+            budget.take_at("a", start + secs(130)),
+            Err(Over::Long(secs(3600 - 130))),
+            "five within the hour; the first leaves it an hour after it was taken"
+        );
+        budget.take_at("b", start + secs(130)).unwrap();
+        budget.take_at("a", start + secs(3600)).unwrap();
     }
 
     #[test]

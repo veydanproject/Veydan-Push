@@ -12,8 +12,8 @@ use sqlx::{Pool, Row, Sqlite};
 use vpush_proto::Prefs;
 
 use super::{
-    Counts, Device, DeviceInput, DeviceLimits, Result, Store, StoreError, WatchedGroup,
-    WatchedRelay,
+    Counts, Device, DeviceInput, DeviceLimits, Result, Store, StoreError, Ticket, TicketGone,
+    TicketInput, TicketRef, WatchedGroup, WatchedRelay,
 };
 
 fn db(e: impl std::fmt::Display) -> StoreError {
@@ -168,6 +168,7 @@ impl SqliteStore {
                 .try_get::<Option<i64>, _>("token_checked_at")
                 .map_err(db)?
                 .map(|v| v.max(0) as u64),
+            seal_to: seal_to(row.try_get("channel_json").map_err(db)?),
             relays,
             groups,
         })
@@ -416,6 +417,20 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await
         .map_err(db)?;
+        // A ticket stands for the token: dead, it wakes nothing more. The
+        // device comes back by registering a live token, and asks anew.
+        if outcome == "dead_token" {
+            sqlx::query(
+                "DELETE FROM tickets WHERE device IN
+                    (SELECT id FROM devices WHERE pubkey = ? AND device_id = ? AND token = ?)",
+            )
+            .bind(pubkey)
+            .bind(device_id)
+            .bind(token)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        }
         Ok(())
     }
 
@@ -432,7 +447,8 @@ impl Store for SqliteStore {
         let row = sqlx::query(
             "SELECT COUNT(*) AS devices,
                     COUNT(DISTINCT pubkey) AS owners,
-                    COALESCE(SUM(state = 'dead_token'), 0) AS dead
+                    COALESCE(SUM(state = 'dead_token'), 0) AS dead,
+                    (SELECT COUNT(*) FROM tickets) AS tickets
              FROM devices",
         )
         .fetch_one(&self.pool)
@@ -442,7 +458,157 @@ impl Store for SqliteStore {
             devices: row.try_get::<i64, _>("devices").map_err(db)? as u64,
             owners: row.try_get::<i64, _>("owners").map_err(db)? as u64,
             dead_tokens: row.try_get::<i64, _>("dead").map_err(db)? as u64,
+            tickets: row.try_get::<i64, _>("tickets").map_err(db)? as u64,
         })
+    }
+
+    async fn issue_ticket(
+        &self,
+        pubkey: &str,
+        device_id: &str,
+        ticket: &TicketInput,
+        per_device: u32,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
+        // A device registered through a gateway has no token to stand for,
+        // and a dead token wakes nothing.
+        let device: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM devices
+             WHERE pubkey = ? AND device_id = ? AND provider <> 'gateway' AND state = 'active'",
+        )
+        .bind(pubkey)
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db)?;
+        let Some(device) = device else {
+            return Err(StoreError::NoDevice);
+        };
+        sqlx::query(
+            "INSERT INTO tickets (hash, prefix, device, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&ticket.hash)
+        .bind(&ticket.prefix)
+        .bind(device)
+        .bind(ticket.issued_at as i64)
+        .bind(ticket.expires_at as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        // What ran out goes, and of the live ones the newest stay: the one
+        // just issued, and `per_device` less one of the others.
+        sqlx::query(
+            "DELETE FROM tickets WHERE device = ? AND hash <> ? AND hash NOT IN
+                (SELECT hash FROM tickets WHERE device = ? AND hash <> ? AND expires_at > ?
+                 ORDER BY issued_at DESC, rowid DESC LIMIT ?)",
+        )
+        .bind(device)
+        .bind(&ticket.hash)
+        .bind(device)
+        .bind(&ticket.hash)
+        .bind(ticket.issued_at as i64)
+        .bind(i64::from(per_device.saturating_sub(1)))
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+        tx.commit().await.map_err(db)
+    }
+
+    async fn tickets_of(&self, pubkey: &str, now: u64) -> Result<Vec<Ticket>> {
+        sqlx::query(
+            "SELECT t.prefix, d.device_id, t.issued_at, t.expires_at, t.last_wake_at
+             FROM tickets t JOIN devices d ON d.id = t.device
+             WHERE d.pubkey = ? AND t.expires_at > ?
+             ORDER BY t.issued_at DESC, t.rowid DESC",
+        )
+        .bind(pubkey)
+        .bind(now as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db)?
+        .into_iter()
+        .map(|row| {
+            let secs = |name: &str| -> Result<u64> {
+                Ok(row.try_get::<i64, _>(name).map_err(db)?.max(0) as u64)
+            };
+            Ok(Ticket {
+                prefix: row.try_get("prefix").map_err(db)?,
+                device_id: row.try_get("device_id").map_err(db)?,
+                issued_at: secs("issued_at")?,
+                expires_at: secs("expires_at")?,
+                last_wake_at: row
+                    .try_get::<Option<i64>, _>("last_wake_at")
+                    .map_err(db)?
+                    .map(|v| v.max(0) as u64),
+            })
+        })
+        .collect()
+    }
+
+    async fn delete_ticket(&self, pubkey: &str, which: &TicketRef) -> Result<TicketGone> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
+        let (column, value) = match which {
+            TicketRef::Hash(hash) => ("hash", hash),
+            TicketRef::Prefix(prefix) => ("prefix", prefix),
+        };
+        // Nothing but the name of one of two columns is put into the statement.
+        let hashes: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT t.hash FROM tickets t JOIN devices d ON d.id = t.device
+             WHERE d.pubkey = ? AND t.{column} = ?"
+        )))
+        .bind(pubkey)
+        .bind(value)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        let gone = match hashes.as_slice() {
+            [] => TicketGone::NotFound,
+            [hash] => {
+                sqlx::query("DELETE FROM tickets WHERE hash = ?")
+                    .bind(hash)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                TicketGone::Removed
+            }
+            _ => TicketGone::Ambiguous,
+        };
+        tx.commit().await.map_err(db)?;
+        Ok(gone)
+    }
+
+    async fn ticket_device(&self, hash: &str, now: u64) -> Result<Option<super::Recipient>> {
+        let row = sqlx::query(
+            "SELECT d.pubkey, d.device_id, d.app_id, d.provider, d.token, d.author_key, d.channel_json
+             FROM tickets t JOIN devices d ON d.id = t.device
+             WHERE t.hash = ? AND t.expires_at > ? AND d.state = 'active' AND d.expires_at > ?",
+        )
+        .bind(hash)
+        .bind(now as i64)
+        .bind(now as i64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db)?;
+        row.as_ref().map(recipient).transpose()
+    }
+
+    async fn ticket_woken(&self, hash: &str, now: u64) -> Result<()> {
+        sqlx::query("UPDATE tickets SET last_wake_at = ? WHERE hash = ?")
+            .bind(now as i64)
+            .bind(hash)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(())
+    }
+
+    async fn purge_tickets(&self, now: u64) -> Result<u64> {
+        let done = sqlx::query("DELETE FROM tickets WHERE expires_at <= ?")
+            .bind(now as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(done.rows_affected())
     }
 }
 
@@ -783,7 +949,7 @@ mod tests {
 
         let s = SqliteStore::open(&path).await.unwrap();
         s.put_device(input(ALICE, "phone-1", "t1"), ROOMY).await.unwrap();
-        assert_eq!(s.schema_version().await.unwrap(), 5);
+        assert_eq!(s.schema_version().await.unwrap(), 7);
         s.close().await;
 
         let s = SqliteStore::open(&path).await.unwrap();
@@ -802,7 +968,17 @@ fn recipient(row: &SqliteRow) -> Result<super::Recipient> {
         provider: row.try_get("provider").map_err(db)?,
         token: row.try_get("token").map_err(db)?,
         author_key: row.try_get("author_key").map_err(db)?,
+        seal_to: seal_to(row.try_get("channel_json").map_err(db)?),
     })
+}
+
+/// The push key of a device registered through the gateway, from what its
+/// channel said.
+fn seal_to(channel_json: Option<String>) -> Option<String> {
+    match serde_json::from_str::<vpush_proto::Channel>(channel_json.as_deref()?) {
+        Ok(vpush_proto::Channel::Gateway { pubkey, .. }) => Some(pubkey),
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -929,7 +1105,7 @@ impl super::WatchStore for SqliteStore {
 
     async fn dm_recipients(&self, pubkey: &str, now: u64) -> Result<Vec<super::Recipient>> {
         sqlx::query(
-            "SELECT d.pubkey, d.device_id, d.app_id, d.provider, d.token, d.author_key
+            "SELECT d.pubkey, d.device_id, d.app_id, d.provider, d.token, d.author_key, d.channel_json
              FROM devices d
              WHERE d.pubkey = ? AND d.pref_dm = 1 AND d.state = 'active' AND d.expires_at > ?
                AND EXISTS (SELECT 1 FROM device_relays r WHERE r.device = d.id AND r.dm = 1)
@@ -973,7 +1149,7 @@ impl super::WatchStore for SqliteStore {
         // every key.
         let held = vec!["?"; keys.len()].join(", ");
         let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT d.pubkey, d.device_id, d.app_id, d.provider, d.token, d.author_key
+            "SELECT d.pubkey, d.device_id, d.app_id, d.provider, d.token, d.author_key, d.channel_json
              FROM device_groups g JOIN devices d ON d.id = g.device
              WHERE g.group_id = ? AND d.pref_groups = 1 AND d.state = 'active' AND d.expires_at > ?
                AND EXISTS (SELECT 1 FROM device_relays r WHERE r.device = d.id AND r.groups = 1)
@@ -1291,7 +1467,7 @@ mod migrate_tests {
         left_by_0_2_2(&path).await;
 
         let s = SqliteStore::open(&path).await.expect("the migration applies");
-        assert_eq!(s.schema_version().await.unwrap(), 5);
+        assert_eq!(s.schema_version().await.unwrap(), 7);
 
         // The device is what it was, and direct messages are pushed to it
         // as before.
@@ -1375,5 +1551,152 @@ mod snapshot_tests {
 
         assert!(SqliteStore::snapshot(&path, &out).await.is_err(), "an existing file is not written over");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod ticket_tests {
+    use super::super::WatchStore;
+    use super::tests_support::{input, ROOMY};
+    use super::*;
+
+    const ALICE: &str = "aa";
+    const BOB: &str = "bb";
+
+    fn ticket(n: u8, at: u64) -> TicketInput {
+        TicketInput {
+            hash: format!("{n:02x}").repeat(32),
+            prefix: format!("{n:02x}").repeat(4),
+            issued_at: at,
+            expires_at: at + 500,
+        }
+    }
+
+    async fn store() -> SqliteStore {
+        let s = SqliteStore::in_memory().await.unwrap();
+        s.put_device(input(ALICE, "phone-1", "t1"), ROOMY).await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn a_ticket_wakes_its_device_until_it_runs_out_and_is_listed_meanwhile() {
+        let s = store().await;
+        s.issue_ticket(ALICE, "phone-1", &ticket(1, 1000), 8).await.unwrap();
+        let woken = s.ticket_device(&ticket(1, 1000).hash, 1200).await.unwrap().expect("a live ticket");
+        assert_eq!((woken.device_id.as_str(), woken.token.as_str()), ("phone-1", "t1"));
+
+        let listed = s.tickets_of(ALICE, 1200).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].prefix.as_str(), listed[0].last_wake_at), ("01010101", None));
+        s.ticket_woken(&ticket(1, 1000).hash, 1300).await.unwrap();
+        assert_eq!(s.tickets_of(ALICE, 1300).await.unwrap()[0].last_wake_at, Some(1300));
+        assert_eq!(s.counts().await.unwrap().tickets, 1);
+
+        // At 1500 it has run out: it wakes nothing and is not listed; the
+        // sweep forgets it.
+        assert!(s.ticket_device(&ticket(1, 1000).hash, 1500).await.unwrap().is_none());
+        assert!(s.tickets_of(ALICE, 1500).await.unwrap().is_empty());
+        assert_eq!(s.purge_tickets(1500).await.unwrap(), 1);
+        assert_eq!(s.counts().await.unwrap().tickets, 0);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_is_for_a_device_of_the_signer_with_a_live_token() {
+        let s = store().await;
+        let refused = |r: Result<()>| matches!(r, Err(StoreError::NoDevice));
+        assert!(refused(s.issue_ticket(BOB, "phone-1", &ticket(1, 1000), 8).await), "not bob's");
+        assert!(refused(s.issue_ticket(ALICE, "phone-2", &ticket(1, 1000), 8).await), "no such device");
+        // A device registered through a gateway has no token to stand for.
+        let mut through = input(ALICE, "phone-3", &"ab".repeat(32));
+        through.provider = "gateway".into();
+        s.put_device(through, ROOMY).await.unwrap();
+        assert!(refused(s.issue_ticket(ALICE, "phone-3", &ticket(1, 1000), 8).await), "a gateway's");
+        // A dead token wakes nothing.
+        s.record_outcome(ALICE, "phone-1", "t1", "dead_token", 1000).await.unwrap();
+        assert!(refused(s.issue_ticket(ALICE, "phone-1", &ticket(1, 1000), 8).await), "dead");
+        assert_eq!(s.counts().await.unwrap().tickets, 0);
+    }
+
+    #[tokio::test]
+    async fn a_device_holds_so_many_tickets_and_the_oldest_goes() {
+        let s = store().await;
+        for n in 1..=4 {
+            s.issue_ticket(ALICE, "phone-1", &ticket(n, 1000 + u64::from(n)), 3).await.unwrap();
+        }
+        let left: Vec<_> = s.tickets_of(ALICE, 1010).await.unwrap().into_iter().map(|t| t.prefix).collect();
+        assert_eq!(left, ["04040404", "03030303", "02020202"]);
+        // Issued in the same second as the newest, the new one stays.
+        s.issue_ticket(ALICE, "phone-1", &ticket(0, 1004), 3).await.unwrap();
+        let left: Vec<_> = s.tickets_of(ALICE, 1010).await.unwrap().into_iter().map(|t| t.prefix).collect();
+        assert_eq!(left.len(), 3);
+        assert!(left.contains(&"00000000".to_string()), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_is_removed_by_its_owner_by_hash_or_prefix() {
+        let s = store().await;
+        s.issue_ticket(ALICE, "phone-1", &ticket(1, 1000), 8).await.unwrap();
+        s.issue_ticket(ALICE, "phone-1", &ticket(2, 1000), 8).await.unwrap();
+        let mut twin = ticket(3, 1000);
+        twin.prefix = "01010101".into();
+        s.issue_ticket(ALICE, "phone-1", &twin, 8).await.unwrap();
+
+        let by_prefix = TicketRef::Prefix("01010101".into());
+        assert_eq!(s.delete_ticket(ALICE, &by_prefix).await.unwrap(), TicketGone::Ambiguous);
+        let second = TicketRef::Hash(ticket(2, 1000).hash);
+        assert_eq!(s.delete_ticket(BOB, &second).await.unwrap(), TicketGone::NotFound);
+        assert_eq!(s.delete_ticket(ALICE, &second).await.unwrap(), TicketGone::Removed);
+        assert_eq!(s.delete_ticket(ALICE, &TicketRef::Hash(twin.hash)).await.unwrap(), TicketGone::Removed);
+        assert_eq!(s.delete_ticket(ALICE, &by_prefix).await.unwrap(), TicketGone::Removed);
+        assert_eq!(s.counts().await.unwrap().tickets, 0);
+    }
+
+    #[tokio::test]
+    async fn the_tickets_of_a_device_go_with_it_and_with_its_dead_token() {
+        let s = store().await;
+        s.put_device(input(ALICE, "phone-2", "t2"), ROOMY).await.unwrap();
+        s.issue_ticket(ALICE, "phone-1", &ticket(1, 1000), 8).await.unwrap();
+        s.issue_ticket(ALICE, "phone-2", &ticket(2, 1000), 8).await.unwrap();
+
+        // A renewal keeps them, a new token too: the ticket wakes the device.
+        s.put_device(input(ALICE, "phone-1", "t1-new"), ROOMY).await.unwrap();
+        let woken = s.ticket_device(&ticket(1, 1000).hash, 1100).await.unwrap().unwrap();
+        assert_eq!(woken.token, "t1-new");
+
+        assert!(s.delete_device(ALICE, "phone-1").await.unwrap());
+        assert!(s.ticket_device(&ticket(1, 1000).hash, 1100).await.unwrap().is_none());
+        // What the push service said of a former token touches nothing.
+        s.record_outcome(ALICE, "phone-2", "t-former", "dead_token", 1100).await.unwrap();
+        assert!(s.ticket_device(&ticket(2, 1000).hash, 1100).await.unwrap().is_some());
+        s.record_outcome(ALICE, "phone-2", "t2", "dead_token", 1100).await.unwrap();
+        assert!(s.ticket_device(&ticket(2, 1000).hash, 1100).await.unwrap().is_none());
+        assert_eq!(s.counts().await.unwrap().tickets, 0);
+
+        // A device that runs out takes its tickets along.
+        s.put_device(input(BOB, "phone-9", "t9"), ROOMY).await.unwrap();
+        s.issue_ticket(BOB, "phone-9", &ticket(9, 1000), 8).await.unwrap();
+        assert!(s.ticket_device(&ticket(9, 1000).hash, 2000).await.unwrap().is_none(), "the device ran out at 2000");
+        s.purge_expired(2000).await.unwrap();
+        assert_eq!(s.counts().await.unwrap().tickets, 0);
+    }
+
+    #[tokio::test]
+    async fn a_device_of_the_gateway_says_its_push_key_and_is_told_with_it() {
+        let s = SqliteStore::in_memory().await.unwrap();
+        let mut through = input(ALICE, "phone-1", &"ab".repeat(32));
+        through.provider = "gateway".into();
+        through.channel_json = Some(format!(
+            r#"{{"provider":"gateway","ticket":"{}","pubkey":"{}"}}"#,
+            "ab".repeat(32),
+            "cd".repeat(32)
+        ));
+        s.put_device(through, ROOMY).await.unwrap();
+        let d = s.device(ALICE, "phone-1").await.unwrap().unwrap();
+        assert_eq!((d.provider.as_str(), d.seal_to), ("gateway", Some("cd".repeat(32))));
+        let to = s.dm_recipients(ALICE, 1500).await.unwrap();
+        assert_eq!(to[0].seal_to, Some("cd".repeat(32)));
+        // A device of FCM has none.
+        s.put_device(input(BOB, "phone-1", "t1"), ROOMY).await.unwrap();
+        assert_eq!(s.dm_recipients(BOB, 1500).await.unwrap()[0].seal_to, None);
     }
 }

@@ -545,7 +545,7 @@ mod tests {
             ttl: Duration::from_secs(60),
             urgent: true,
         };
-        let body = FcmClient::body(&Target { token: "t".into() }, &message, &payload);
+        let body = FcmClient::body(&Target::of("t"), &message, &payload);
         let message = &body["message"];
         assert!(message.get("notification").is_none());
         assert!(message["android"].get("notification").is_none());

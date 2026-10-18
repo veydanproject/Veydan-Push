@@ -21,6 +21,10 @@ pub enum StoreError {
     /// The server holds as many devices as it takes.
     #[error("the server is full")]
     Full,
+    /// A ticket is asked for a device that is not registered here with a
+    /// live token of a push service.
+    #[error("no such device")]
+    NoDevice,
 }
 
 /// How many devices there may be.
@@ -99,6 +103,8 @@ pub struct Device {
     /// When the push service said the token is one it can push to, or took
     /// a push for it. `None`: nothing is known of the token yet.
     pub token_checked_at: Option<u64>,
+    /// The push key of a device registered through the gateway.
+    pub seal_to: Option<String>,
     pub relays: Vec<WatchedRelay>,
     pub groups: Vec<WatchedGroup>,
 }
@@ -109,6 +115,8 @@ pub struct Counts {
     pub devices: u64,
     pub owners: u64,
     pub dead_tokens: u64,
+    /// Live tickets of the gateway.
+    pub tickets: u64,
 }
 
 #[async_trait]
@@ -157,6 +165,76 @@ pub trait Store: Send + Sync + 'static {
     async fn purge_expired(&self, now: u64) -> Result<u64>;
 
     async fn counts(&self) -> Result<Counts>;
+
+    /// Keeps a ticket of a gateway for a device of the owner, and lets go
+    /// of the oldest live ones past `per_device`. [`StoreError::NoDevice`]
+    /// when the owner has no such device here with a live token of a push
+    /// service (one registered through a gateway is none).
+    async fn issue_ticket(
+        &self,
+        pubkey: &str,
+        device_id: &str,
+        ticket: &TicketInput,
+        per_device: u32,
+    ) -> Result<()>;
+
+    /// The live tickets of the devices of an owner, the newest first.
+    async fn tickets_of(&self, pubkey: &str, now: u64) -> Result<Vec<Ticket>>;
+
+    /// Removes a ticket of a device of the owner.
+    async fn delete_ticket(&self, pubkey: &str, which: &TicketRef) -> Result<TicketGone>;
+
+    /// The device a live ticket wakes, by the hash of the ticket. `None`:
+    /// expired, removed, or never issued; or its device is gone, dead, or
+    /// expired.
+    async fn ticket_device(&self, hash: &str, now: u64) -> Result<Option<Recipient>>;
+
+    /// Notes that the ticket was woken.
+    async fn ticket_woken(&self, hash: &str, now: u64) -> Result<()>;
+
+    /// Forgets the tickets that ran out. Returns how many.
+    async fn purge_tickets(&self, now: u64) -> Result<u64>;
+}
+
+/// A ticket as it is kept: not the ticket, which is said once to the device
+/// and kept nowhere, but its hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketInput {
+    /// SHA-256 of the ticket's 64 hex characters, hex.
+    pub hash: String,
+    /// The first 8 hex of the ticket: how it is named in a list.
+    pub prefix: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+}
+
+/// A live ticket, as its owner may see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ticket {
+    pub prefix: String,
+    pub device_id: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub last_wake_at: Option<u64>,
+}
+
+/// Which ticket to remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketRef {
+    /// By the hash of the whole ticket.
+    Hash(String),
+    /// By its first 8 hex, when no other ticket of the owner begins so.
+    Prefix(String),
+}
+
+/// What became of a removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketGone {
+    Removed,
+    /// The owner has no such ticket.
+    NotFound,
+    /// More than one ticket of the owner begins so; nothing was removed.
+    Ambiguous,
 }
 
 /// What is watched on one relay.
@@ -211,6 +289,9 @@ pub struct Recipient {
     pub provider: String,
     pub token: String,
     pub author_key: Option<String>,
+    /// The push key of a device registered through the gateway: every push
+    /// to it is sealed to it.
+    pub seal_to: Option<String>,
 }
 
 /// What the server does on the relays.

@@ -27,7 +27,7 @@ ring = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 async-trait = { workspace = true }
-nostr = { workspace = true }
+nostr = { workspace = true, features = ["nip44"] }
 nostr-sdk = { workspace = true }
 futures-util = { workspace = true }
 sqlx = { workspace = true }
