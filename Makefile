@@ -29,13 +29,14 @@ ctl:
 release:
 	@bash scripts/build-release.sh
 
-# Static binary copied into the bin folder of a server kit, which installs it
+# Static binaries (vpush, vguard) copied into the bin folder of a server kit, which installs them
 # from there:  make build-deploy DEPLOY_BIN=<folder>
 build-deploy: release
 	@if [ -z "$(DEPLOY_BIN)" ]; then echo ">> make build-deploy DEPLOY_BIN=<folder>"; exit 1; fi
 	@mkdir -p $(DEPLOY_BIN)
-	@cp dist/vpush dist/vpush.sha256 dist/RELEASE $(DEPLOY_BIN)/
+	@cp dist/vpush dist/vpush.sha256 dist/RELEASE dist/vguard dist/vguard.sha256 dist/vguard.RELEASE $(DEPLOY_BIN)/
 	@echo ">> $(DEPLOY_BIN)/vpush  $$(cat dist/RELEASE)"
+	@echo ">> $(DEPLOY_BIN)/vguard  $$(cat dist/vguard.RELEASE)"
 
 # Build, send to the server, switch, check; rolls back by itself on failure.
 deploy:

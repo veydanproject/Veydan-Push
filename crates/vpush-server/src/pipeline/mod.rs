@@ -32,10 +32,14 @@ use crate::delivery::retry::{self, RetryPolicy};
 use crate::delivery::{mask, Message, Outcome, ProviderKind, Providers, Target};
 use crate::store::{AllStore, Recipient, Seen};
 use classify::Subject;
-use throttle::{DeviceCap, Named, Room, Throttle, Verdict};
+use throttle::{CallBudget, DeviceCap, Named, Room, Throttle, Verdict};
 
 /// How long the push service keeps a push for a phone that is off.
 const TTL: Duration = Duration::from_secs(24 * 3600);
+/// How long it keeps the push of a call: an invitation is good for 45
+/// seconds from its making, and a phone that comes back later has a missed
+/// call to show, which the app takes from the relay itself.
+const CALL_TTL: Duration = Duration::from_secs(60);
 /// Pushes on their way to the push services at one time.
 const SENDING: usize = 32;
 /// For how long an event that was dealt with is remembered. A relay is
@@ -77,7 +81,8 @@ pub enum Dealt {
         /// Devices of the author, which are not told.
         own: usize,
         /// Devices that were pushed to as often as a device may be:
-        /// counted, for their `sync` push.
+        /// counted, for their `sync` push; or rung for as many calls as
+        /// a device may be, which are dropped.
         over: usize,
     },
 }
@@ -90,6 +95,10 @@ pub struct Waking {
     /// About anything: this many times within `device_window`.
     pub device_cap: usize,
     pub device_window: Duration,
+    /// For a call: this many times within `call_window`, past the two
+    /// above; the rest is dropped.
+    pub call_cap: usize,
+    pub call_window: Duration,
 }
 
 impl From<&PipelineConfig> for Waking {
@@ -98,6 +107,8 @@ impl From<&PipelineConfig> for Waking {
             chat_every: Duration::from_secs(config.throttle_secs),
             device_cap: config.device_cap as usize,
             device_window: Duration::from_secs(config.device_window_secs),
+            call_cap: config.call_cap as usize,
+            call_window: Duration::from_secs(config.call_window_secs),
         }
     }
 }
@@ -107,6 +118,10 @@ pub struct Pipeline {
     providers: Arc<Providers>,
     throttle: Throttle,
     cap: DeviceCap,
+    calls: CallBudget,
+    /// The ends of ringings, on the same cap as the rings and apart from
+    /// them.
+    call_ends: CallBudget,
     sending: Arc<Semaphore>,
     retry: RetryPolicy,
     counters: Arc<Counters>,
@@ -115,7 +130,8 @@ pub struct Pipeline {
 /// A push on its way out: what is sent, to whom, and what the log says of it.
 struct Parcel {
     trace: String,
-    /// `dm`, `group`, `sync`.
+    /// `dm`, `group`, `sync`; `call` for a direct message marked as a call,
+    /// `call_end` for one marked as the end of a ringing.
     kind: &'static str,
     /// The relay the event came from. A `sync` push is about no one event.
     relay: Option<String>,
@@ -186,6 +202,8 @@ impl Pipeline {
             providers,
             throttle: Throttle::new(waking.chat_every),
             cap: DeviceCap::new(waking.device_cap, waking.device_window),
+            calls: CallBudget::new(waking.call_cap, waking.call_window),
+            call_ends: CallBudget::new(waking.call_cap, waking.call_window),
             sending: Arc::new(Semaphore::new(SENDING)),
             retry,
             counters,
@@ -278,6 +296,16 @@ impl Pipeline {
         }
 
         let json: Arc<str> = event.as_json().into();
+        // A call rings now or never: it goes past the throttle of the chat
+        // and the cap of the device, both of which would turn it into a
+        // count in a push that comes when the call is over. The mark of a
+        // call is on the outside of the wrap, where anyone can put it, so
+        // a budget of its own holds a flood of calls back (`CallBudget`);
+        // the push of a call is one device's, lives a minute and replaces
+        // the call before it. The end of a ringing goes the same way, on
+        // a budget of its own: it must not use up the rings of a device,
+        // nor a flood of ends the real ones.
+        let call = classify::call_mark(event);
         let (mut pushed, mut later, mut own, mut over) = (0, 0, 0, 0);
         for to in recipients {
             // A group event says nothing of its author on the outside but
@@ -296,6 +324,33 @@ impl Pipeline {
                 subject: subject.clone(),
                 to,
             };
+            if let Some(mark) = call {
+                let (budget, kind) = match mark {
+                    classify::CallMark::Ring => (&self.calls, "call"),
+                    classify::CallMark::End => (&self.call_ends, "call_end"),
+                };
+                if !budget.allow(&order.device(), Instant::now()) {
+                    tracing::warn!(
+                        trace,
+                        kind,
+                        owner = %mask(&order.to.pubkey),
+                        device = %order.to.device_id,
+                        "rung for as many calls as a device may be; the call is not pushed"
+                    );
+                    over += 1;
+                    continue;
+                }
+                self.send(Parcel {
+                    message: Self::call_message(&order, mark),
+                    trace: order.trace,
+                    kind,
+                    relay: Some(order.relay),
+                    to: order.to,
+                    count: 1,
+                });
+                pushed += 1;
+                continue;
+            }
             match self.throttle.event(&order.key(), Instant::now(), order.named()) {
                 Verdict::Now => {
                     if self.push(order, 1) {
@@ -438,6 +493,13 @@ impl Pipeline {
     /// one event. A push for several events names the last of them: the
     /// device cannot show them all from one, and takes them from the relay.
     fn message(order: &Order, count: u32) -> Message {
+        Self::build(order, count, false)
+    }
+
+    /// The push of `message` and of `call_message`: `call` marks it as a
+    /// call's in both forms, so that the mark counts where the event has
+    /// to fit.
+    fn build(order: &Order, count: u32, call: bool) -> Message {
         let mut payload = match &order.subject {
             Subject::Dm { .. } => Payload::new(PushType::Dm),
             Subject::Group { id } => {
@@ -448,6 +510,7 @@ impl Pipeline {
         };
         payload.count = (count > 1).then_some(count);
         payload.trace = Some(order.trace.clone());
+        payload.call = call;
 
         let mut by_id = payload.clone();
         by_id.event_id = Some(order.event_id.clone());
@@ -468,6 +531,26 @@ impl Pipeline {
             ttl: TTL,
             urgent: true,
         }
+    }
+
+    /// The push of a call, a ring or the end of one: the same push as a
+    /// message's (`dm`, the event inside when it fits; the phone opens it
+    /// and finds the invitation, or the end), marked as a call (`call`),
+    /// urgent, alive for a minute, and replacing the one before it of its
+    /// kind: a ring the ring before it (`call`), an end the end before it
+    /// (`call_end`). An end never takes the place of a ring: the server
+    /// cannot tell which call it ends, and the end of one call would
+    /// silence the waiting ring of another. A phone that was off gets
+    /// both, and rings nothing for a call whose end it has seen.
+    fn call_message(order: &Order, mark: classify::CallMark) -> Message {
+        let mut message = Self::build(order, 1, true);
+        let key = match mark {
+            classify::CallMark::Ring => "call",
+            classify::CallMark::End => "call_end",
+        };
+        message.collapse_key = Some(Self::collapse(key));
+        message.ttl = CALL_TTL;
+        message
     }
 
     /// A key the push service replaces a waiting push by: the newest word

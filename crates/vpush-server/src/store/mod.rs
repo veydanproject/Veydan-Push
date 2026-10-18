@@ -4,7 +4,7 @@
 //! [`Store`] trait. SQL does not leave this module, so another database can
 //! take the place of SQLite by writing one more implementation.
 
-mod sqlite;
+pub(crate) mod sqlite;
 
 pub use sqlite::SqliteStore;
 
@@ -132,6 +132,10 @@ pub trait Store: Send + Sync + 'static {
 
     /// True when there was one.
     async fn delete_device(&self, pubkey: &str, device_id: &str) -> Result<bool>;
+    /// Every device of one owner forgotten at once, with their relays and
+    /// groups: the step `push.forget` of the deletion of an account of
+    /// Veydan Cloud (the admin request `devices_forget`). How many went.
+    async fn forget_owner(&self, pubkey: &str) -> Result<u64>;
 
     /// Notes what became of the last push to the device. `dead_token` also
     /// marks the device so that nothing more is sent to it, and `delivered`

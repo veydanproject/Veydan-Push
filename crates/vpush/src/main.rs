@@ -73,6 +73,11 @@ enum Ctl {
         /// The owner's public key: npub or hex.
         owner: String,
     },
+    /// Forget every device of one owner: the step of the deletion of an account of Veydan Cloud.
+    DevicesForget {
+        /// The owner's public key: npub or hex.
+        owner: String,
+    },
     /// The relays on the line, and how each is doing.
     Relays,
     /// How many devices and owners there are, and what was counted since the start.
@@ -149,6 +154,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 Ctl::Log(LogCmd::Show) => Request::LogShow,
                 Ctl::Log(LogCmd::Reset) => Request::LogReset,
                 Ctl::Devices { owner } => Request::Devices { owner },
+                Ctl::DevicesForget { owner } => Request::DevicesForget { owner },
                 Ctl::Stats => Request::Stats,
                 Ctl::Relays => Request::Relays,
                 Ctl::TestPush {

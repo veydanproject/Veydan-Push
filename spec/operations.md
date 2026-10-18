@@ -222,6 +222,7 @@ binary before it switches.
 | `log.format` | `text` | `text` or `json` |
 | `log.level` | `info` | Level of everything not named in `log.targets` |
 | `log.targets` | empty | Level per module or crate |
+| `denied_keys_file` | `denied-keys.txt` beside `store.path` | The keys denied on every server of the network, one 64-hex key a line, `#` a comment; laid by the agent of vcloud (its helper, as a file of the `paths` of the component `vpush`) and looked at again once a minute. No file, nobody denied. A top-level key: it goes above every table of the file |
 
 An unknown key is an error. So is a value of the wrong type.
 
@@ -390,6 +391,7 @@ Two more limits are not in the config:
 |---|---|---|
 | Registrations (`PUT`) of one owner | 10 in a minute | `rate_limited` |
 | New devices from one address | 20 in an hour, when `server.trusted_proxy` is on | `rate_limited` |
+| Any request to `/v1/devices` from one address | 120 in a minute, when `server.trusted_proxy` is on | `rate_limited` |
 
 A new device is a `device_id` its owner has not registered, or another
 token for one that is: each costs a question to the push service and, when
@@ -431,6 +433,12 @@ became of the last push, and when the push service vouched for the token
 the beginning of its id and the number of push keys the device registered
 for it, never the keys: `111111111111 (2 keys)`.
 
+`devices-forget npub1…` forgets every device of the owner at once, with the
+relays and groups watched for them, and says how many went: the step
+`push.forget` of the deletion of an account of Veydan Cloud, which the
+agent of vcloud runs over the admin socket (`{"cmd":"devices_forget"}`).
+A device registers again on the next start of the app, as a new one.
+
 `stats` says how many devices and owners there are, and under `since_start`
 what the server has counted since it started:
 
@@ -438,6 +446,7 @@ what the server has counted since it started:
 { "devices": 412, "owners": 380, "dead_tokens": 3,
   "since_start": { "refused_rate_owner": 0, "refused_rate_ip": 0,
                    "refused_devices_total": 0, "tokens_invalid": 2,
+                   "refused_denied": 0,
                    "sync_pushes": 0, "lines_started_over": 0,
                    "group_events_unmarked": 0 } }
 ```
@@ -448,6 +457,7 @@ what the server has counted since it started:
 | `refused_rate_ip` | New devices refused: more than 20 an hour from one address | Somebody registering devices in bulk; or many users behind one address, if it grows slowly |
 | `refused_devices_total` | Registrations refused: `limits.devices_total` is reached | The server is full: raise the limit, or look at who registered |
 | `tokens_invalid` | Registrations refused: FCM does not know the token | Made-up registrations; a few are phones whose token ran out |
+| `refused_denied` | Requests refused: the key is denied on the servers of the network | An app of a denied key that keeps trying; the journal says when the list was read (`denied keys`) |
 | `sync_pushes` | Pushes of the type `sync` | Some device gets more than `pipeline.device_cap` pushes a minute |
 | `lines_started_over` | Times a relay's line started over | See "Relays on the line" |
 | `group_events_unmarked` | Events of watched groups without the mark of a push key registered for the group | Somebody who is not a member writes into a group by its id; or an app older than the mark. See "Group events from strangers" |

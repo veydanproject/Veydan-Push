@@ -118,12 +118,14 @@ pub async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     ));
 
     let api = Api::new(Arc::new(config), store, providers, relays, watcher, counters);
+    let denied_task = tokio::spawn(api::watch_denied(Arc::clone(&api.denied)));
     axum::serve(listener, api::router(api))
         .with_graceful_shutdown(stopped(stop_rx))
         .await
         .context("http server")?;
     let _ = admin_task.await;
     let _ = watch_task.await;
+    denied_task.abort();
     sqlite.close().await;
 
     tracing::info!("vpush stopped");

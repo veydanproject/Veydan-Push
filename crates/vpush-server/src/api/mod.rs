@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use tower_http::timeout::TimeoutLayer;
+use vpush_proto::denied::{DeniedKeys, Refreshed, RELOAD_EVERY};
 use vpush_proto::{AppInfo, ErrorBody, ErrorCode, ErrorDetail, Info, Limits};
 
 use crate::auth::Nip98;
@@ -44,6 +45,8 @@ pub struct Api {
     pub auth: Arc<Nip98>,
     pub limits: Arc<Limiters>,
     pub counters: Arc<Counters>,
+    /// The keys denied on every server (`Config::denied_keys_path`).
+    pub denied: Arc<DeniedKeys>,
 }
 
 impl Api {
@@ -56,6 +59,7 @@ impl Api {
         counters: Arc<Counters>,
     ) -> Self {
         Self {
+            denied: Arc::new(DeniedKeys::from_file(&config.denied_keys_path())),
             auth: Arc::new(Nip98::new(&config.public_url)),
             limits: Arc::new(Limiters::new(config.limits.test_per_hour)),
             counters,
@@ -75,10 +79,34 @@ pub fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Looks at the file of the denied keys every minute, for as long as the
+/// task lives: the agent of vcloud lays a new one within a minute of a
+/// denial. What changed goes to the log, the keys never.
+pub async fn watch_denied(denied: Arc<DeniedKeys>) {
+    let path = denied.path().map(|p| p.display().to_string()).unwrap_or_default();
+    tracing::info!(file = %path, keys = denied.len(), "denied keys");
+    let mut tick = tokio::time::interval(RELOAD_EVERY);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        match denied.refresh() {
+            Refreshed::Same => {}
+            Refreshed::Loaded(keys) => tracing::info!(file = %path, keys, "denied keys read again"),
+            Refreshed::Missing => tracing::info!(file = %path, "no file of denied keys: nobody is denied"),
+            Refreshed::Refused(why) => tracing::warn!(file = %path, %why, "the file of denied keys does not read; the list before stays"),
+        }
+    }
+}
+
 /// Registrations one owner may make in a minute. An app registers when
 /// something changed and once in seven days; ten a minute is a burst of
 /// changes and more, and every one past that is somebody trying the server.
 pub const PUTS_PER_MINUTE: usize = 10;
+
+/// Requests to the devices of the API one address (a /64 of IPv6) may make in
+/// a minute, whoever signs them. An app asks once in a while; the room is for
+/// many phones behind one address.
+pub const REQUESTS_PER_MINUTE: usize = 120;
 
 /// Devices the server did not know that may be registered from one address
 /// in an hour. Each of them costs a question to the push service and a row.
@@ -95,6 +123,8 @@ pub struct Limiters {
     /// Registrations of a device the server did not know, by the address
     /// they came from.
     new_devices: Limiter<IpAddr>,
+    /// Every request to a device, by the address it came from.
+    requests: Limiter<IpAddr>,
 }
 
 impl Limiters {
@@ -109,6 +139,7 @@ impl Limiters {
             tests: Limiter::new(Self::HOUR, tests_per_hour as usize, Self::MAX_KEYS),
             puts: Limiter::new(Self::MINUTE, PUTS_PER_MINUTE, Self::MAX_KEYS),
             new_devices: Limiter::new(Self::HOUR, NEW_DEVICES_PER_HOUR, Self::MAX_KEYS),
+            requests: Limiter::new(Self::MINUTE, REQUESTS_PER_MINUTE, Self::MAX_KEYS),
         }
     }
 
@@ -125,6 +156,11 @@ impl Limiters {
     /// Counts one more registration of the owner.
     pub fn registration(&self, owner: &str) -> Result<(), Duration> {
         self.puts.take(owner.to_string())
+    }
+
+    /// Counts one more request from the address.
+    pub fn request(&self, from: IpAddr) -> Result<(), Duration> {
+        self.requests.take(network(from))
     }
 
     /// Counts one more new device from the address.
@@ -292,6 +328,24 @@ mod tests {
         let wait = limits.registration("alice").unwrap_err();
         assert!(wait <= Limiters::MINUTE && wait > Duration::from_secs(50), "{wait:?}");
         limits.registration("bob").unwrap();
+    }
+
+    #[test]
+    fn requests_are_counted_by_the_address_and_an_ipv6_network_is_one_address() {
+        let limits = Limiters::new(3);
+        let from = |address: &str| limits.request(address.parse().unwrap());
+        for _ in 0..REQUESTS_PER_MINUTE {
+            from("203.0.113.7").unwrap();
+        }
+        let wait = from("203.0.113.7").unwrap_err();
+        assert!(wait <= Limiters::MINUTE && wait > Duration::from_secs(50), "{wait:?}");
+        from("203.0.113.8").unwrap();
+        assert!(from("::ffff:203.0.113.7").is_err());
+        from("2001:db8:1:2::1").unwrap();
+        for _ in 1..REQUESTS_PER_MINUTE {
+            from("2001:db8:1:2:aaaa::1").unwrap();
+        }
+        assert!(from("2001:db8:1:2::9").is_err());
     }
 
     #[test]

@@ -39,6 +39,9 @@ pub struct Counters {
     pub refused_devices_total: Counter,
     /// Registrations refused because the push service does not know the token.
     pub tokens_invalid: Counter,
+    /// Requests refused because the key that signed is denied on the
+    /// servers of the network.
+    pub refused_denied: Counter,
     /// Pushes that said how many events came over what a device is pushed
     /// about one by one.
     pub sync_pushes: Counter,
@@ -67,6 +70,7 @@ mod tests {
                 "refused_rate_ip": 0,
                 "refused_devices_total": 0,
                 "tokens_invalid": 2,
+                "refused_denied": 0,
                 "sync_pushes": 1,
                 "lines_started_over": 0,
                 "group_events_unmarked": 0,

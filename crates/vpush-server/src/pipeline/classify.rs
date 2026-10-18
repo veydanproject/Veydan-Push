@@ -16,6 +16,8 @@ pub const KIND_GROUP: u16 = 9;
 pub const TAG_SILENT: &str = "silent";
 pub const TAG_AUTHOR: &str = "vp";
 pub const TAG_GROUP: &str = "gp";
+/// A call: the phone rings for it now or never (`messenger-dm::wrap`).
+pub const TAG_CALL: &str = "call";
 
 /// How many marks of its group are read off one event. An app puts one, or
 /// two for a week after the key of the group changed; whatever comes after
@@ -73,6 +75,42 @@ pub fn subject(event: &Event) -> Option<Subject> {
 /// The author marked the event as not worth a push.
 pub fn is_silent(event: &Event) -> bool {
     values(event, TAG_SILENT).next().is_some()
+}
+
+/// What the mark of a call on a wrap says (`messenger-dm::wrap::Wake`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallMark {
+    /// `["call", "1"]`: an invitation, which rings a phone now or never.
+    Ring,
+    /// `["call", "0"]`: the end of a ringing (the call was taken on another
+    /// device, declined, or given up), which a phone ringing from a push
+    /// must hear now or it rings on for nothing.
+    End,
+}
+
+/// The value of the mark that means the end of a ringing; any other value
+/// is a ring, so that a mark from a newer app still wakes the phone.
+const CALL_MARK_END: &str = "0";
+
+/// The author marked the event as a call: an invitation that rings a phone
+/// now or never, or the end of one. On a sealed direct message only; a
+/// group event that says so is a message of the group like any other.
+pub fn call_mark(event: &Event) -> Option<CallMark> {
+    if event.kind.as_u16() != KIND_WRAP {
+        return None;
+    }
+    values(event, TAG_CALL).next().map(|value| {
+        if value == CALL_MARK_END {
+            CallMark::End
+        } else {
+            CallMark::Ring
+        }
+    })
+}
+
+/// The author marked the event as a call, a ring or an end of one.
+pub fn is_call(event: &Event) -> bool {
+    call_mark(event).is_some()
 }
 
 /// The mark of the author on a group event.
@@ -185,6 +223,29 @@ mod tests {
         assert!(is_silent(&event(1059, &[&["p", &a], &["silent", "1"]])));
         assert!(!is_silent(&event(1059, &[&["p", &a]])));
         assert!(!is_silent(&event(1059, &[&["p", "silent"]])));
+    }
+
+    /// The same value is in the tests of `messenger-dm::wrap`.
+    #[test]
+    fn a_call_is_a_tag_on_the_outside_of_a_wrap() {
+        let a = "aa".repeat(32);
+        assert!(is_call(&event(1059, &[&["p", &a], &["call", "1"]])));
+        assert!(!is_call(&event(1059, &[&["p", &a]])));
+        assert!(!is_call(&event(1059, &[&["p", "call"]])));
+        assert!(!is_call(&event(9, &[&["h", &a], &["call", "1"]])), "a group event is not a call");
+    }
+
+    /// `1` rings, `0` ends a ringing, and a value this server does not
+    /// know rings: the phone opens the wrap and sees what it is.
+    #[test]
+    fn the_mark_of_a_call_says_whether_it_rings_or_ends() {
+        let a = "aa".repeat(32);
+        assert_eq!(call_mark(&event(1059, &[&["p", &a], &["call", "1"]])), Some(CallMark::Ring));
+        assert_eq!(call_mark(&event(1059, &[&["p", &a], &["call", "0"]])), Some(CallMark::End));
+        assert_eq!(call_mark(&event(1059, &[&["p", &a], &["call", "2"]])), Some(CallMark::Ring));
+        assert_eq!(call_mark(&event(1059, &[&["p", &a]])), None);
+        assert_eq!(call_mark(&event(9, &[&["h", &a], &["call", "0"]])), None);
+        assert!(is_call(&event(1059, &[&["p", &a], &["call", "0"]])));
     }
 
     /// The same values are in the tests of `messenger-dm::pushtags`. They

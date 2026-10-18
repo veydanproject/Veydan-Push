@@ -4,6 +4,8 @@
 #   dist/vpush          the binary
 #   dist/vpush.sha256   its checksum
 #   dist/RELEASE        the release name, <version>-<commit>
+#   dist/vguard         the read policy of a relay (crates/vguard), the same way
+#   dist/vguard.sha256  its checksum; dist/vguard.RELEASE its release name
 #
 # A static build needs a C compiler for musl. Order of choice: zig (fetched
 # into the tools directory when missing), then musl-gcc from the system.
@@ -11,6 +13,12 @@ set -euo pipefail
 
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
 cd "$VPUSH_DIR"
+
+# The monorepo's build environment points C compilers at the desktop's
+# glibc headers (CFLAGS) and the linker at its libraries (RUSTFLAGS). A
+# static musl build must see none of that: C compiled against glibc 2.38+
+# headers wants __isoc23_sscanf and open64, which musl has not.
+unset CFLAGS CXXFLAGS CPPFLAGS RUSTFLAGS GCC_EXEC_PREFIX
 
 TARGET="${VPUSH_TARGET:-x86_64-unknown-linux-musl}"
 ZIG_VERSION="${VPUSH_ZIG_VERSION:-0.13.0}"
@@ -63,21 +71,27 @@ else
 fi
 
 # --- build -------------------------------------------------------------------
-say "building vpush $sha for $TARGET (cargo $builder)"
-cargo "$builder" --release --locked --target "$TARGET" -p vpush
+say "building vpush and vguard $sha for $TARGET (cargo $builder)"
+cargo "$builder" --release --locked --target "$TARGET" -p vpush -p vguard
 
 bin="$(cargo_target_dir)/$TARGET/release/vpush"
-[ -x "$bin" ] || die "no binary at $bin"
-
-# A binary that needs libraries from the build machine is not a release.
-if command -v ldd >/dev/null 2>&1 && ldd "$bin" 2>/dev/null | grep -q '=>'; then
-  die "$bin is dynamically linked"
-fi
+guard="$(cargo_target_dir)/$TARGET/release/vguard"
+for b in "$bin" "$guard"; do
+  [ -x "$b" ] || die "no binary at $b"
+  # A binary that needs libraries from the build machine is not a release.
+  if command -v ldd >/dev/null 2>&1 && ldd "$b" 2>/dev/null | grep -q '=>'; then
+    die "$b is dynamically linked"
+  fi
+done
 
 mkdir -p dist
 cp "$bin" dist/vpush
 (cd dist && sha256sum vpush > vpush.sha256)
+cp "$guard" dist/vguard
+(cd dist && sha256sum vguard > vguard.sha256)
 version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 echo "$version-$sha" > dist/RELEASE
+echo "$version-$sha" > dist/vguard.RELEASE
 
 say "dist/vpush  $(cat dist/RELEASE)  $(du -h dist/vpush | cut -f1)"
+say "dist/vguard  $(cat dist/vguard.RELEASE)  $(du -h dist/vguard | cut -f1)"

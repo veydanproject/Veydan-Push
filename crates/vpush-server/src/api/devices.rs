@@ -21,7 +21,7 @@ use vpush_proto::{
     RelayView, TestAnswer,
 };
 
-use super::{error, now, Api, RequestId, NEW_DEVICES_PER_HOUR, PUTS_PER_MINUTE};
+use super::{error, now, Api, RequestId, NEW_DEVICES_PER_HOUR, PUTS_PER_MINUTE, REQUESTS_PER_MINUTE};
 use crate::auth::AuthError;
 use crate::delivery::{
     check_token, mask, test_push, Outcome, ProviderKind, PushProvider, Target, TokenCheck,
@@ -118,6 +118,9 @@ impl From<AuthError> for Refusal {
 struct Asked {
     /// The owner: the key that signed the request.
     pubkey: String,
+    /// The id of the signed event, not yet remembered as used: see
+    /// [`remembered`].
+    event: [u8; 32],
     device_id: String,
     body: Bytes,
 }
@@ -153,6 +156,17 @@ fn asked(
             },
         )
     })?;
+    // Before anything costs a signature check: a client that asks too often
+    // is told so, whoever it says it is.
+    if let Some(from) = client(api, headers) {
+        api.limits.request(from).map_err(|wait| {
+            api.counters.refused_rate_ip.add();
+            Refusal::too_often(
+                format!("{REQUESTS_PER_MINUTE} requests from one address a minute; come back later"),
+                wait,
+            )
+        })?;
+    }
     if !device_id_ok(&device_id) {
         return Err(Refusal::bad(
             "the device id is 8 to 64 letters, digits, `_` or `-`",
@@ -168,14 +182,34 @@ fn asked(
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or_else(|| uri.path());
-    let pubkey = api
+    let verified = api
         .auth
-        .check(header, method.as_str(), path_and_query, &body, now())?;
+        .verify(header, method.as_str(), path_and_query, &body, now())?;
+    // A key denied on the servers of the network registers nothing here,
+    // and reads nothing: its devices were forgotten when it was denied.
+    // Asked after the signature, so that nobody can name another's key.
+    if api.denied.contains(&verified.pubkey) {
+        api.counters.refused_denied.add();
+        return Err(Refusal::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::KeyDenied,
+            "the key is denied on the servers of Veydan",
+        ));
+    }
     Ok(Asked {
-        pubkey,
+        pubkey: verified.pubkey,
+        event: verified.event,
         device_id,
         body,
     })
+}
+
+/// Uses the signed event up. Done once the request has shown it is worth a
+/// place in the memory shared by all: the device is the signer's, or the
+/// registration is valid. A request signed by a key made a moment ago, for a
+/// device nobody has, takes none.
+fn remembered(api: &Api, asked: &Asked) -> Result<(), Refusal> {
+    api.auth.remember(asked.event).map_err(Refusal::from)
 }
 
 /// What to tell about a relay: whether the server agrees to watch it, and
@@ -444,6 +478,7 @@ pub async fn put(
             relays,
             provider,
         } = accepted(&api, &asked, put)?;
+        remembered(&api, &asked)?;
 
         let stored = api
             .store
@@ -578,6 +613,7 @@ pub async fn get(
             .await
             .map_err(|e| Refusal::internal(e, &rid))?
             .ok_or_else(no_device)?;
+        remembered(&api, &asked)?;
         Ok::<_, Refusal>(view(&api, device))
     }
     .await;
@@ -611,6 +647,9 @@ pub async fn delete(
             "device removed"
         );
         if was {
+            // The event is used up by a removal that happened. A removal of
+            // what is not there is the same again, and takes no place.
+            remembered(&api, &asked)?;
             api.watch.plan_changed();
         }
         // Removing what is not there is what the client wanted anyway.
@@ -640,6 +679,7 @@ pub async fn test(
             .await
             .map_err(|e| Refusal::internal(e, &rid))?
             .ok_or_else(no_device)?;
+        remembered(&api, &asked)?;
 
         api.limits.test(&device.token).map_err(|wait| {
             Refusal::too_often(

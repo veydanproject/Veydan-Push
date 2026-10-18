@@ -31,6 +31,7 @@ Every answer that is not 2xx has this body:
 | `auth_expired` | 401 | The event is more than 60 seconds from the server's clock. `error.server_time` carries that clock, unix seconds |
 | `auth_replay` | 401 | This event was used already |
 | `auth_url_mismatch` | 401 | The event was signed for another address |
+| `key_denied` | 403 | The key that signed is denied on every server of the network (Veydan Cloud). Nothing of it is registered or read; see "Denied keys" |
 | `not_found` | 404 | No such route, or no such device of this owner |
 | `payload_too_large` | 413 | The body is above `limits.max_body_bytes` |
 | `unknown_app` | 422 | The server does not serve this `app_id` |
@@ -74,7 +75,10 @@ Three things go wrong most often:
   a trailing slash and add the path to it. A query is a part of the address.
 - **The nonce.** An event is accepted once. Two requests of the same second,
   to the same address, with the same body are the same event without a
-  nonce, and the second is refused with `auth_replay`.
+  nonce, and the second is refused with `auth_replay`. An event is
+  used up by a request that reaches a device of the signer (or a valid
+  registration), so a request for a device that is not there can be sent again
+  with the same event, and gets the same answer.
 - **The clock.** On `auth_expired`, take `server_time` from the answer, sign
   again with the clock corrected by the difference, and repeat once.
 
@@ -215,10 +219,11 @@ what the token is worth.
 |---|---|
 | Registrations of one owner | 10 in a minute |
 | New devices from one network address | 20 in an hour |
+| Any request to a device, whoever signs it | 120 in a minute from one network address |
 
 More than that is answered with `rate_limited` and `Retry-After`. A new
 device is a `device_id` the owner has not registered, or another token for
-one that is; renewing a device as it is does not count. The second limit is
+one that is; renewing a device as it is does not count. The second and the third limits are
 there only when the server is told whom a request came from by the proxy in
 front of it.
 
@@ -293,6 +298,7 @@ push is shown the same way, with a line of the device's own.
 | `count` | when above one; always in `sync` | How many events this push stands for |
 | `data` | service pushes | A JSON string; its meaning depends on `type` |
 | `trace` | always | Id of this push in the server's log |
+| `call` | `dm`, when the wrap is marked as a call | `"1"`: the event carries an invitation to a call, or the end of one, as its author marked it on the outside (see `["call", "1"]` and `["call", "0"]`); the device opens it even when it shows no content of messages, rings for it when it is a call indeed, and stops ringing when it is the end of one |
 
 ### The event, or where to find it
 
@@ -386,6 +392,64 @@ Without the tag every one of these wakes somebody with "New message".
 A relay learns from the tag that the event is not a message. It does not
 learn which of the things above it is.
 
+### `["call", "1"]`
+
+On a gift wrap (kind 1059): the invitation to a call, which rings a phone
+now or never. The server treats it as a direct message with four
+differences:
+
+- it is pushed at once, past the throttle of the chat and the 30 a minute
+  of the device: counted and told later it would ring for a call that is
+  over;
+- a device is rung for no more than a few calls a minute (`[pipeline]
+  call_cap`, `call_window_secs`; 6 in 60 by default): the tag is on the
+  outside, where anyone who knows the key can put it, and without a limit
+  of its own a stranger could wake the phone urgently as often as they
+  like, until the push service takes the app's urgent pushes for noise.
+  What comes over the budget is dropped, not told later; the app finds
+  the invitation on the relay when it runs;
+- the push service keeps it for a minute, not a day (`ttl`), since the
+  invitation is good for 45 seconds from its making; a phone that comes
+  back later finds a missed call on its relays;
+- it replaces the ring before it while it waits (`collapse_key` `call`),
+  not the last word about the chat.
+
+The push itself is a `dm` push with `call` set to `"1"`: the event inside
+when it fits, otherwise its id and relay. The phone opens it and finds the
+invitation; the mark tells it to open the event even when its settings
+show no content of messages, and the invitation of somebody it has no
+mutual chat with rings nothing. An app that knows no calls shows a
+message it cannot read.
+
+A relay learns from the tag that the wrap is a call. It does not learn who
+calls whom beyond the recipient every wrap names, or whether the call is
+answered. The copy of the invitation for the author's other devices carries
+`silent`, as every copy does.
+
+### `["call", "0"]`: the end of a ringing
+
+A phone that rings from the push of a call while its app is not running
+cannot hear from the relays that the call is over, and would ring on until
+the invitation expires. So the signals that end a ringing are marked on
+the outside too, with `0`: the messenger puts the mark on the copy for its
+own devices of its answer, its refusal, its "busy" and its end of a call
+(the user took the call on another device), and on the peer's copy of the
+end of a call (the caller gave up). Such a wrap is pushed as a call is: at
+once, urgent, for a minute, as a `dm` push with `call` set to `"1"` (the
+phone opens it and sees that it is an end, not a ring; an app that knows
+only `"1"` opens it and finds a note that is not a message, and shows
+nothing). It carries a collapse key of its own, `call_end`: it replaces
+the end before it while it waits, and never a ring. The server cannot
+tell which call an end is the end of, and under one key the end of one
+call would take the place of the waiting ring of another, which is still
+live. A phone that was off gets the ring and the end both, in whichever
+order, and rings nothing for a call whose end it has seen.
+
+The ends are on a budget of their own, with the same cap and window as the
+rings: the ends of a device do not use up its rings, nor a flood of ends
+the real ones. A value of the tag the server does not know is taken as a
+ring: the phone opens the wrap and decides.
+
 ### `["vp", "<16 hex>"]`: the mark of the author
 
 On every group event. A group event is signed by a key made for that one
@@ -472,6 +536,20 @@ push_key = c960ddf616adb9a57ac7d0eb04da5e25cf3d139c95d5828addb8f1f0ed50da28
 mark     = 86a8b9acabf6941d
 ```
 
+## Denied keys
+
+The owner of the network can deny a key on every server it runs
+(Veydan Cloud, `services/cloud/spec/cloud-api.md` §14). A push server of
+the network reads the denied keys from a file vcloud lays beside its
+database (`denied_keys_file`, `spec/operations.md`), one key a line, and
+looks at it again once a minute. A request to `/v1/devices/…` signed by
+such a key is answered `403 key_denied`, after the signature is checked
+and before anything else: nothing is registered, read or removed, and the
+push service is asked nothing. When the key was denied its devices were
+forgotten at once (`vpush ctl devices-forget`), so no push reaches its
+phone. Lifted, the key registers again as before. No file, nobody is
+denied.
+
 ## What a push server cannot do
 
 - **Relays that give a sealed message to its recipient only.** Some relays
@@ -484,6 +562,16 @@ mark     = 86a8b9acabf6941d
   sees who wrote it, and shows the message or keeps quiet.
 - **Messages of the user's own key from another app**, which puts no
   `silent` on its copies.
+- **Keep from a relay whom it watches there.** To hear of an event the
+  server asks every relay it watches for the gift wraps of every key
+  registered there (`#p`) and the events of every group watched (`#h`),
+  in the open, in subscriptions of up to 500 values each. Whoever runs the
+  relay, or reads its traffic inside, learns the keys that use this push
+  server and the groups one of them is in, and so that these keys use
+  it. The event itself stays sealed. The relays of the Veydan network
+  take VPush by the key of the peers, past their read policy
+  (`spec/vguard.md`); a relay of somebody else that gives wraps to their
+  own key only cannot be watched at all (above).
 
 ### What it holds back, and cannot stop
 

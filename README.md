@@ -6,7 +6,7 @@ wakes their devices when something arrives for them.
 The server never sees message contents. It sees that an encrypted event
 addressed to a user appeared on a relay, and tells the user's device.
 
-**State: 0.3.1.** Devices register, relays are watched, and a message on a
+**State: 0.4.0.** Devices register, relays are watched, and a message on a
 relay becomes a push through FCM that the phone opens itself. What is
 ahead: commands of the admin by direct message, UnifiedPush.
 
@@ -16,6 +16,9 @@ ahead: commands of the admin by direct message, UnifiedPush.
 crates/vpush-proto    what the server and its clients exchange (serde only)
 crates/vpush-server   the server, as a library
 crates/vpush          the binary: server and admin command line in one file
+crates/vguard         VGuard, the read policy of a relay: a proxy between nginx
+                      and strfry that answers a question for another key's
+                      gift wraps or for groups it does not name itself
 deploy/               systemd unit, example config, example deploy settings
 scripts/              build, deploy, rollback
 golden/               examples of the protocol, the contract with the clients
@@ -24,7 +27,9 @@ spec/                 the protocol for clients, and how to run the server
 
 The protocol a client speaks is in [spec/protocol.md](spec/protocol.md);
 running, logging and every setting are in
-[spec/operations.md](spec/operations.md).
+[spec/operations.md](spec/operations.md). VGuard, which shares the nostr and
+WebSocket stack of VPush and is built and shipped with it, is in
+[spec/vguard.md](spec/vguard.md).
 
 ## Working on it
 

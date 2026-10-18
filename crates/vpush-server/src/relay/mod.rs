@@ -105,6 +105,13 @@ impl Watch {
         self.changed.notify_one();
     }
 
+    /// Whether a change is waiting to be read, which takes it.
+    #[cfg(test)]
+    pub(crate) fn plan_pending(&self) -> bool {
+        use futures_util::FutureExt;
+        self.changed.notified().now_or_never().is_some()
+    }
+
     pub fn health(&self) -> Vec<RelayHealth> {
         self.health.lock().unwrap().values().cloned().collect()
     }

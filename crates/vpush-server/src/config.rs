@@ -38,6 +38,13 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    /// The keys denied on every server of the network, one a line, laid by
+    /// the agent of vcloud (`spec/protocol.md`, "Denied keys"): a device
+    /// of such a key is not registered. Not given: `denied-keys.txt` beside
+    /// the database, so a server of the kit reads it without a line of
+    /// its own here; no file there denies nobody.
+    #[serde(default)]
+    pub denied_keys_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +127,11 @@ pub struct PipelineConfig {
     /// over that is counted, and told in one `sync` push.
     pub device_cap: u32,
     pub device_window_secs: u64,
+    /// A device is rung for no more than this many calls within
+    /// `call_window_secs`: a call goes past the two limits above, and
+    /// anyone can mark a wrap as a call. What comes over that is dropped.
+    pub call_cap: u32,
+    pub call_window_secs: u64,
 }
 
 impl Default for PipelineConfig {
@@ -128,6 +140,8 @@ impl Default for PipelineConfig {
             throttle_secs: 20,
             device_cap: 30,
             device_window_secs: 60,
+            call_cap: 6,
+            call_window_secs: 60,
         }
     }
 }
@@ -238,6 +252,15 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 impl Config {
+    /// The file of the denied keys: `denied_keys_file`, or `denied-keys.txt`
+    /// in the folder of the database.
+    pub fn denied_keys_path(&self) -> PathBuf {
+        match &self.denied_keys_file {
+            Some(path) => path.clone(),
+            None => self.store.path.parent().unwrap_or_else(|| Path::new(".")).join(vpush_proto::denied::FILE_NAME),
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let fail = |problem: String| ConfigError {
             path: path.to_path_buf(),
@@ -304,6 +327,12 @@ impl Config {
         }
         if self.server.max_body_bytes == 0 {
             out.push("server.max_body_bytes: must be above zero".to_string());
+        }
+
+        if let Some(path) = &self.denied_keys_file {
+            if !path.is_absolute() {
+                out.push(format!("denied_keys_file: `{}` must be an absolute path", path.display()));
+            }
         }
 
         if !self.admin.socket.is_absolute() {
@@ -427,6 +456,14 @@ impl Config {
         if self.pipeline.device_window_secs == 0 {
             out.push("pipeline.device_window_secs: must be above zero".to_string());
         }
+        // No calls at all is not a limit of calls, and a window of no
+        // length holds nothing back.
+        if self.pipeline.call_cap == 0 {
+            out.push("pipeline.call_cap: must be above zero".to_string());
+        }
+        if self.pipeline.call_window_secs == 0 {
+            out.push("pipeline.call_window_secs: must be above zero".to_string());
+        }
 
         out
     }
@@ -514,8 +551,8 @@ impl Config {
         out.push((
             "pipeline".to_string(),
             format!(
-                "throttle_secs={} device_cap={} device_window_secs={}",
-                p.throttle_secs, p.device_cap, p.device_window_secs
+                "throttle_secs={} device_cap={} device_window_secs={} call_cap={} call_window_secs={}",
+                p.throttle_secs, p.device_cap, p.device_window_secs, p.call_cap, p.call_window_secs
             ),
         ));
         out
@@ -651,6 +688,12 @@ mod tests {
         assert_eq!((pipeline.device_cap, pipeline.device_window_secs), (1, 1));
         let pipeline = with("").unwrap().pipeline;
         assert_eq!((pipeline.device_cap, pipeline.device_window_secs), (30, 60));
+        assert_eq!((pipeline.call_cap, pipeline.call_window_secs), (6, 60));
+        let problems = with("call_cap = 0\ncall_window_secs = 0").unwrap_err();
+        assert_eq!(
+            problems,
+            ["pipeline.call_cap: must be above zero", "pipeline.call_window_secs: must be above zero"]
+        );
     }
 
     #[test]

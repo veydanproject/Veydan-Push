@@ -44,6 +44,10 @@ pub enum Request {
     },
     /// The devices of one owner, and what is watched for each.
     Devices { owner: String },
+    /// Every device of one owner forgotten, with their relays and groups:
+    /// the step `push.forget` of the deletion of an account of Veydan
+    /// Cloud, run by the agent of vcloud (services/cloud, `account.purge`).
+    DevicesForget { owner: String },
     /// How many devices and owners there are, and what the server has
     /// counted since it started.
     Stats,
@@ -91,6 +95,7 @@ impl Request {
             Self::LogReset => "log_reset",
             Self::TestPush { .. } => "test_push",
             Self::Devices { .. } => "devices",
+            Self::DevicesForget { .. } => "devices_forget",
             Self::Stats => "stats",
             Self::Relays => "relays",
         }
@@ -326,6 +331,13 @@ async fn handle(request: Request, state: &AdminState) -> Response {
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Request::DevicesForget { owner } => {
+            let pubkey = match nostr::key::PublicKey::parse(owner.trim()) {
+                Ok(key) => key.to_hex(),
+                Err(_) => return Response::err("not a public key: give an npub or 64 hex characters"),
+            };
+            forget(state.store.as_ref(), &state.watch, pubkey).await
+        }
         Request::Relays => Response::ok(state.watch.health()),
         Request::Stats => match state.store.counts().await {
             Ok(counts) => Response::ok(Stats {
@@ -334,6 +346,21 @@ async fn handle(request: Request, state: &AdminState) -> Response {
             }),
             Err(e) => Response::err(e.to_string()),
         },
+    }
+}
+
+/// Removes the devices of an owner, and tells the watcher at once: the relays
+/// stop asking for the owner's messages now, not at the next plan.
+async fn forget(store: &dyn Store, watch: &Watch, pubkey: String) -> Response {
+    match store.forget_owner(&pubkey).await {
+        Ok(forgotten) => {
+            tracing::info!(owner = %pubkey, forgotten, "the devices of an owner forgotten");
+            if forgotten > 0 {
+                watch.plan_changed();
+            }
+            Response::ok(serde_json::json!({ "owner": pubkey, "forgotten": forgotten }))
+        }
+        Err(e) => Response::err(e.to_string()),
     }
 }
 
@@ -408,6 +435,26 @@ pub async fn call(socket: &Path, request: &Request) -> anyhow::Result<serde_json
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn forgetting_an_owner_makes_the_watcher_read_the_plan_again() {
+        use crate::store::sqlite::tests_support::input;
+        let store = crate::store::SqliteStore::in_memory().await.unwrap();
+        let watch = Watch::new();
+        store
+            .put_device(
+                input("aa", "phone-1", "t1"),
+                crate::store::DeviceLimits { per_owner: 5, total: 5 },
+            )
+            .await
+            .unwrap();
+        assert!(!watch.plan_pending());
+
+        forget(&store, &watch, "bb".into()).await;
+        assert!(!watch.plan_pending(), "nobody was forgotten, nothing changed");
+        forget(&store, &watch, "aa".into()).await;
+        assert!(watch.plan_pending());
+    }
+
     #[test]
     fn stats_keep_their_shape_and_add_what_was_counted_since_the_start() {
         let counters = Counters::default();
@@ -422,7 +469,7 @@ mod tests {
                 "devices": 3, "owners": 2, "dead_tokens": 1,
                 "since_start": {
                     "refused_rate_owner": 0, "refused_rate_ip": 0,
-                    "refused_devices_total": 0, "tokens_invalid": 0,
+                    "refused_devices_total": 0, "tokens_invalid": 0, "refused_denied": 0,
                     "sync_pushes": 0, "lines_started_over": 1,
                     "group_events_unmarked": 0,
                 },

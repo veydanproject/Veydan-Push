@@ -206,6 +206,55 @@ impl DeviceCap {
     }
 }
 
+/// How many calls a device is rung for. A call goes past the throttle of
+/// the chat and the cap of the device (it rings now or never), and the
+/// mark of a call sits on the outside of a wrap, where anyone can put it:
+/// without a limit of its own, a stranger who knows the key could wake
+/// the phone, urgently, as often as they like, and the push service would
+/// soon take the app's urgent pushes for noise. So a device is rung for no
+/// more than `cap` calls within `window`. What comes over that is dropped,
+/// not counted: a call told later rings for nothing, and the app finds
+/// the invitation on the relay when it runs.
+pub struct CallBudget {
+    cap: usize,
+    window: Duration,
+    /// When each device was rung within the window, the oldest first.
+    states: Mutex<HashMap<Device, VecDeque<Instant>>>,
+}
+
+impl CallBudget {
+    /// More states than this, and the ones that did their work are dropped.
+    const SWEEP_AT: usize = 10_000;
+
+    pub fn new(cap: usize, window: Duration) -> Self {
+        Self {
+            cap,
+            window,
+            states: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `device` may be rung now; counted when it may.
+    pub fn allow(&self, device: &Device, now: Instant) -> bool {
+        let mut states = self.states.lock().unwrap();
+        let window = self.window;
+        let recent = |at: &Instant| now.duration_since(*at) < window;
+        if states.len() >= Self::SWEEP_AT {
+            states.retain(|_, rung| rung.back().is_some_and(recent));
+        }
+        let rung = states.entry(device.clone()).or_default();
+        while rung.front().is_some_and(|at| !recent(at)) {
+            rung.pop_front();
+        }
+        if rung.len() < self.cap {
+            rung.push_back(now);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +428,36 @@ mod tests {
         assert_eq!(cap.push(&("owner".into(), "tablet".into()), now, 1), Room::Yes);
         assert_eq!(cap.push(&("other".into(), "phone".into()), now, 1), Room::Yes);
         assert_eq!(cap.due(&phone()), None);
+    }
+
+    /// A stranger publishes wraps marked as calls as fast as they like:
+    /// the phone is rung a few times a minute and no more; a minute
+    /// later there is room again, one call at a time.
+    #[test]
+    fn a_device_is_rung_for_a_few_calls_a_minute_and_the_flood_is_dropped() {
+        let budget = CallBudget::new(2, MINUTE);
+        let start = Instant::now();
+        assert!(budget.allow(&phone(), start));
+        assert!(budget.allow(&phone(), start + secs(10)));
+        for i in 11..60 {
+            assert!(!budget.allow(&phone(), start + secs(i)), "call {i}");
+        }
+        assert!(budget.allow(&phone(), start + secs(60)), "the first left the window");
+        assert!(!budget.allow(&phone(), start + secs(61)));
+        assert!(budget.allow(&phone(), start + secs(70)), "the second left the window");
+        // Another device, another budget.
+        assert!(budget.allow(&("owner".into(), "tablet".into()), start + secs(61)));
+    }
+
+    #[test]
+    fn devices_rung_long_ago_are_swept() {
+        let budget = CallBudget::new(1, MINUTE);
+        let start = Instant::now();
+        for i in 0..CallBudget::SWEEP_AT {
+            budget.allow(&("owner".into(), format!("device-{i}")), start);
+        }
+        assert!(budget.allow(&phone(), start + MINUTE));
+        assert_eq!(budget.states.lock().unwrap().len(), 1, "the new one alone");
     }
 
     #[test]

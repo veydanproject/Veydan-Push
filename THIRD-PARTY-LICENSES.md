@@ -201,7 +201,7 @@ copy of the server, next to its binary. It lists every crate of
 | memchr | 2.8.3 | Unlicense OR MIT |
 | mime | 0.3.17 | MIT OR Apache-2.0 |
 | mio | 1.2.3 | MIT |
-| negentropy | 0.5.1 | MIT |
+| negentropy | 0.5.2 | MIT |
 | nostr | 0.45.5 | MIT |
 | nostr-database | 0.45.2 | MIT |
 | nostr-gossip | 0.45.1 | MIT |
@@ -248,7 +248,7 @@ copy of the server, next to its binary. It lists every crate of
 | ring | 0.17.14 | Apache-2.0 AND ISC |
 | rustc_version | 0.4.1 | MIT OR Apache-2.0 |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT |
-| rustls | 0.23.45 | Apache-2.0 OR ISC OR MIT |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT |
 | rustls-native-certs | 0.8.4 | Apache-2.0 OR ISC OR MIT |
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 |
 | rustls-platform-verifier | 0.7.1 | MIT OR Apache-2.0 |

@@ -177,7 +177,11 @@ impl SqliteStore {
 #[async_trait]
 impl Store for SqliteStore {
     async fn put_device(&self, d: DeviceInput, limits: DeviceLimits) -> Result<()> {
-        let mut tx = self.pool.begin().await.map_err(db)?;
+        // The write lock is taken first: the counts below are read and the
+        // row written with no other writer between. A deferred transaction
+        // read first and was refused at its first write, once another one
+        // had committed, as a failure of the database and not as a limit.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
 
         // The address at the push service moved to this owner and device.
         sqlx::query(
@@ -374,6 +378,16 @@ impl Store for SqliteStore {
         Ok(done.rows_affected() > 0)
     }
 
+    async fn forget_owner(&self, pubkey: &str) -> Result<u64> {
+        // device_relays and device_groups go with the rows (ON DELETE CASCADE).
+        let done = sqlx::query("DELETE FROM devices WHERE pubkey = ?")
+            .bind(pubkey)
+            .execute(&self.pool)
+            .await
+            .map_err(db)?;
+        Ok(done.rows_affected())
+    }
+
     async fn record_outcome(
         &self,
         pubkey: &str,
@@ -433,7 +447,7 @@ impl Store for SqliteStore {
 }
 
 #[cfg(test)]
-mod tests_support {
+pub(crate) mod tests_support {
     pub use super::super::RelayPlan;
     pub use super::*;
 
@@ -595,6 +609,36 @@ mod tests {
         assert!(s.device(ALICE, "phone-1").await.unwrap().is_none());
         assert!(s.device(BOB, "phone-1").await.unwrap().is_some());
         assert_eq!(s.counts().await.unwrap().devices, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registrations_at_the_same_time_do_not_pass_the_limit() {
+        const TWO: DeviceLimits = DeviceLimits { per_owner: 2, total: 3 };
+        let dir = std::env::temp_dir().join(format!("vpush-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = SqliteStore::open(&dir.join("push.db")).await.unwrap();
+
+        let tries: Vec<_> = (0..12)
+            .map(|n| {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    // Three owners, four phones each: two per owner, three in all.
+                    let owner = ["aa", "bb", "cc"][n % 3];
+                    s.put_device(input(owner, &format!("d{n}"), &format!("t{n}")), TWO).await
+                })
+            })
+            .collect();
+        let (mut taken, mut refused) = (0, 0);
+        for try_ in tries {
+            match try_.await.unwrap() {
+                Ok(()) => taken += 1,
+                Err(StoreError::TooManyDevices | StoreError::Full) => refused += 1,
+                Err(e) => panic!("a limit is said as a limit, not as {e}"),
+            }
+        }
+        assert_eq!((taken, refused), (3, 9));
+        assert_eq!(s.counts().await.unwrap().devices, 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

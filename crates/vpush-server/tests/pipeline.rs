@@ -144,6 +144,8 @@ fn waking(window: Duration) -> Waking {
         chat_every: window,
         device_cap: 10_000,
         device_window: Duration::from_secs(60),
+        call_cap: 10_000,
+        call_window: Duration::from_secs(60),
     }
 }
 
@@ -858,6 +860,125 @@ async fn a_burst_wakes_the_phone_twice_and_the_second_push_counts_the_rest() {
     assert_ne!(carried(at_once)["id"], named, "and not the one pushed at once");
 }
 
+/// An invitation to a call (`["call", "1"]` on the outside) is pushed at
+/// once, however recently the chat woke the phone, lives a minute at the
+/// push service and replaces the call before it; the push is otherwise a
+/// message's, which the phone opens to find the call.
+#[tokio::test]
+async fn a_call_goes_past_the_throttle_and_lives_a_minute() {
+    let r = relay().await;
+    let server = server(&[&r], Duration::from_secs(2)).await;
+    let alice = Keys::generate();
+    server.register(&alice, "phone", &[&r]).await;
+    server.watching(&alice, &[&r]).await;
+
+    let started = Instant::now();
+    // A message wakes the phone and starts the window of the chat; a
+    // second message would be counted and told after the window.
+    r.publish(&wrap(&alice, &[])).await;
+    let invite = wrap(&alice, &[&["call", "1"]]);
+    r.publish(&invite).await;
+    let again = wrap(&alice, &[&["call", "1"]]);
+    r.publish(&again).await;
+
+    let pushes = server.pushes_are(3).await;
+    assert!(started.elapsed() < Duration::from_secs(2), "the calls did not wait for the window");
+    let calls: Vec<&Value> = pushes.iter().filter(|p| p["android"]["ttl"] == "60s").collect();
+    assert_eq!(calls.len(), 2, "{pushes:#?}");
+    let ids: Vec<Value> = calls.iter().map(|p| carried(&p["data"])["id"].clone()).collect();
+    assert!(ids.contains(&json!(invite.id.to_hex())) && ids.contains(&json!(again.id.to_hex())), "{ids:?}");
+    for push in &calls {
+        assert_eq!(push["data"]["type"], "dm");
+        assert!(push["data"].get("count").is_none());
+        assert_eq!(push["data"]["call"], "1", "marked as a call for the phone");
+        assert_eq!(push["android"]["priority"], "HIGH");
+    }
+    // One call replaces the one before it, and neither replaces the last
+    // word about the chat (the keys are masked, as every key is).
+    let message = pushes.iter().find(|p| p["android"]["ttl"] != "60s").unwrap();
+    assert_eq!(message["android"]["ttl"], "86400s");
+    assert!(message["data"].get("call").is_none());
+    assert_eq!(calls[0]["android"]["collapse_key"], calls[1]["android"]["collapse_key"]);
+    assert_ne!(calls[0]["android"]["collapse_key"], message["android"]["collapse_key"]);
+}
+
+/// The mark of a call is on the outside of the wrap, where anyone can put
+/// it, and a call goes past the throttle and the cap: a stranger who
+/// publishes a flood of "calls" rings the phone a few times a minute and
+/// no more. What comes over the budget is dropped, not told later.
+#[tokio::test]
+async fn a_flood_of_calls_rings_the_phone_a_few_times_a_minute() {
+    let r = relay().await;
+    let mut waking = waking(Duration::from_secs(2));
+    waking.call_cap = 2;
+    let server = server_with(&[&r], waking, at_once()).await;
+    let alice = Keys::generate();
+    server.register(&alice, "phone", &[&r]).await;
+    server.watching(&alice, &[&r]).await;
+
+    for _ in 0..5 {
+        r.publish(&wrap(&alice, &[&["call", "1"]])).await;
+    }
+    let pushes = server.pushes_are(2).await;
+    for push in &pushes {
+        assert_eq!(push["android"]["ttl"], "60s");
+        assert_eq!(push["data"]["call"], "1");
+    }
+    // A message is not a call: it is pushed as ever, with the chat's
+    // window fresh, and no `sync` push tells of the dropped calls.
+    r.publish(&wrap(&alice, &[])).await;
+    let pushes = server.pushes_are(3).await;
+    assert_eq!(pushes[2]["data"]["type"], "dm");
+    assert!(pushes[2]["data"].get("call").is_none());
+}
+
+/// The end of a ringing (`["call", "0"]`: the call was taken on another
+/// device, declined, or given up) goes the way of a call: at once, for a
+/// minute, marked `call` for the phone (which opens it and sees the end),
+/// under a collapse key of its own, so that it never takes the place of
+/// a waiting ring (of another call: the server cannot tell). It is on a
+/// budget of its own: the ends do not use up the rings of a device, nor
+/// a flood of ends the real ones.
+#[tokio::test]
+async fn the_end_of_a_ringing_goes_like_a_call_on_its_own_budget() {
+    let r = relay().await;
+    let mut waking = waking(Duration::from_secs(2));
+    waking.call_cap = 1;
+    let server = server_with(&[&r], waking, at_once()).await;
+    let alice = Keys::generate();
+    server.register(&alice, "phone", &[&r]).await;
+    server.watching(&alice, &[&r]).await;
+
+    let started = Instant::now();
+    let ring = wrap(&alice, &[&["call", "1"]]);
+    r.publish(&ring).await;
+    let end = wrap(&alice, &[&["call", "0"]]);
+    r.publish(&end).await;
+    // A second ring and a second end: each over its own cap, dropped.
+    r.publish(&wrap(&alice, &[&["call", "1"]])).await;
+    r.publish(&wrap(&alice, &[&["call", "0"]])).await;
+
+    let pushes = server.pushes_are(2).await;
+    assert!(started.elapsed() < Duration::from_secs(2), "the end did not wait for the window");
+    let ids: Vec<Value> = pushes.iter().map(|p| carried(&p["data"])["id"].clone()).collect();
+    assert!(ids.contains(&json!(ring.id.to_hex())) && ids.contains(&json!(end.id.to_hex())), "{ids:?}");
+    for push in &pushes {
+        assert_eq!(push["data"]["type"], "dm");
+        assert_eq!(push["data"]["call"], "1", "marked as a call for the phone, as the ring is");
+        assert!(push["data"].get("count").is_none());
+        assert_eq!(push["android"]["ttl"], "60s");
+        assert_eq!(push["android"]["priority"], "HIGH");
+    }
+    // The end is in the place of the end before it, never of a ring: the
+    // server cannot tell which call it ends, and under one key the end of
+    // one call would silence the waiting ring of another.
+    let key_of = |id: &str| {
+        pushes.iter().find(|p| carried(&p["data"])["id"] == json!(id)).map(|p| p["android"]["collapse_key"].clone()).unwrap()
+    };
+    assert_ne!(key_of(&ring.id.to_hex()), key_of(&end.id.to_hex()), "the end must not take the place of a ring");
+    assert!(key_of(&end.id.to_hex()).is_string() && key_of(&ring.id.to_hex()).is_string());
+}
+
 #[tokio::test]
 async fn what_came_while_the_server_was_away_is_pushed_once_when_it_is_back() {
     let r = relay().await;
@@ -1117,6 +1238,7 @@ async fn a_device_is_pushed_to_thirty_times_and_told_of_the_rest_in_one_push() {
         chat_every: SHORT,
         device_cap: 30,
         device_window: Duration::from_secs(2),
+        ..waking(SHORT)
     };
     let server = server_with(&[&r], cap, at_once()).await;
     let alice = Keys::generate();

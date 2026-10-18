@@ -31,6 +31,8 @@ struct Server {
     store: Arc<SqliteStore>,
     counters: Arc<Counters>,
     google: MockServer,
+    /// The denied keys the server reads, to look at its file again.
+    denied: Arc<vpush_proto::denied::DeniedKeys>,
 }
 
 /// What marks the request that asks FCM about a token and sends nothing.
@@ -41,6 +43,11 @@ async fn start() -> Server {
 }
 
 async fn start_with(more_config: &str) -> Server {
+    start_full("", more_config).await
+}
+
+/// `top`: keys of the top of the file, before every table.
+async fn start_full(top: &str, more_config: &str) -> Server {
     let google = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/token"))
@@ -57,6 +64,7 @@ async fn start_with(more_config: &str) -> Server {
     let config = Config::parse(&format!(
         r#"
         public_url = "{public}"
+        {top}
         [apps."{APP}".fcm]
         service_account = "/nowhere/fcm.json"
         [apps."app.without.push"]
@@ -93,6 +101,7 @@ async fn start_with(more_config: &str) -> Server {
         vpush_server::relay::Watch::new(),
         counters.clone(),
     );
+    let denied = Arc::clone(&api.denied);
     tokio::spawn(async move {
         axum::serve(listener, api::router(api)).await.unwrap();
     });
@@ -104,6 +113,7 @@ async fn start_with(more_config: &str) -> Server {
         store,
         counters,
         google,
+        denied,
     }
 }
 
@@ -1010,13 +1020,119 @@ async fn two_requests_of_one_second_need_a_nonce_to_be_two() {
             .unwrap();
         format!("Nostr {}", STANDARD.encode(serde_json::to_vec(&event).unwrap()))
     };
-    assert_eq!(server.send("GET", DEVICE, Some(bare(at)), vec![]).await.status, 404);
+    // Of a device that is there: an event is used up by a request that
+    // got as far as the device. (Of one that is not, it is not: see
+    // `signatures_for_nothing_take_no_place_in_the_memory`.)
+    let put = server.ask(&alice, "PUT", DEVICE, Some(registration())).await;
+    assert_eq!(put.status, 200, "{}", put.body);
+    assert_eq!(server.send("GET", DEVICE, Some(bare(at)), vec![]).await.status, 200);
     let second = server.send("GET", DEVICE, Some(bare(at)), vec![]).await;
     assert_eq!((second.status, code(&second)), (401, "auth_replay"));
 
     // With a nonce each request is its own event.
     for _ in 0..3 {
         let header = signed(&alice, "GET", &url, b"", at);
-        assert_eq!(server.send("GET", DEVICE, Some(header), vec![]).await.status, 404);
+        assert_eq!(server.send("GET", DEVICE, Some(header), vec![]).await.status, 200);
     }
+}
+
+#[tokio::test]
+async fn signatures_for_nothing_take_no_place_in_the_memory() {
+    let server = start().await;
+    let stranger = Keys::generate();
+    let url = format!("{}{DEVICE}", server.public);
+    let header = signed(&stranger, "GET", &url, b"", now());
+    // A device nobody has: the event is not used up, so asking again with it
+    // is the same answer and not a replay. Nothing was put into the memory
+    // all the requests of all the owners share.
+    for _ in 0..3 {
+        let got = server.send("GET", DEVICE, Some(header.clone()), vec![]).await;
+        assert_eq!((got.status, code(&got)), (404, "not_found"), "{}", got.body);
+    }
+    let removed = signed(&stranger, "DELETE", &url, b"", now());
+    for _ in 0..2 {
+        assert_eq!(server.send("DELETE", DEVICE, Some(removed.clone()), vec![]).await.status, 204);
+    }
+
+    // The owner of a device is the one whose request is remembered.
+    let owner = Keys::generate();
+    let put = server.ask(&owner, "PUT", DEVICE, Some(registration())).await;
+    assert_eq!(put.status, 200, "{}", put.body);
+    let header = signed(&owner, "DELETE", &url, b"", now());
+    assert_eq!(server.send("DELETE", DEVICE, Some(header.clone()), vec![]).await.status, 204);
+    // The same removal again finds nothing, and is the same answer.
+    assert_eq!(server.send("DELETE", DEVICE, Some(header), vec![]).await.status, 204);
+}
+
+#[tokio::test]
+async fn requests_from_one_address_are_counted_whoever_signs_them() {
+    let server = start_with("[server]\ntrusted_proxy = true\n").await;
+    let get_from = |from: &str| {
+        let header = signed(&Keys::generate(), "GET", &format!("{}{DEVICE}", server.public), b"", now());
+        let from = from.to_string();
+        let server = &server;
+        async move { server.send_with("GET", DEVICE, Some(header), vec![], &[("x-real-ip", &from)]).await }
+    };
+    for n in 0..120 {
+        let got = get_from("203.0.113.7").await;
+        assert_eq!(got.status, 404, "request {n}: {}", got.body);
+    }
+    let refused = get_from("203.0.113.7").await;
+    assert_eq!((refused.status, code(&refused)), (429, "rate_limited"), "{}", refused.body);
+    let wait: u64 = refused.retry_after.unwrap().parse().unwrap();
+    assert!((1..=60).contains(&wait), "{wait}");
+    assert_eq!(server.counters.refused_rate_ip.get(), 1);
+
+    // A /64 of IPv6 is one address, another address has its own allowance.
+    assert_eq!(get_from("2001:db8:1:2::1").await.status, 404);
+    for _ in 0..119 {
+        get_from("2001:db8:1:2:ffff::1").await;
+    }
+    assert_eq!(get_from("2001:db8:1:2::2").await.status, 429);
+    assert_eq!(get_from("203.0.113.8").await.status, 404);
+}
+
+#[tokio::test]
+async fn a_denied_key_registers_nothing_and_the_file_is_read_again() {
+    let dir = std::env::temp_dir().join(format!("vpush-denied-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("denied-keys.txt");
+    let mallory = Keys::generate();
+    let alice = Keys::generate();
+    std::fs::write(&file, format!("# laid by vcloud\n{}\n", mallory.public_key().to_hex())).unwrap();
+    let server = start_full(&format!("denied_keys_file = \"{}\"", file.display()), "").await;
+    server.fcm_says_of_a_token(ResponseTemplate::new(200).set_body_json(json!({ "name": "projects/veydan-test/messages/1" }))).await;
+
+    // Refused after the signature: key_denied, nothing kept, counted.
+    let put = server.ask(&mallory, "PUT", DEVICE, Some(registration())).await;
+    assert_eq!((put.status, code(&put)), (403, "key_denied"), "{}", put.body);
+    assert!(server.store.device(&mallory.public_key().to_hex(), "phone-0001").await.unwrap().is_none());
+    assert_eq!(code(&server.ask(&mallory, "GET", DEVICE, None).await), "key_denied");
+    assert_eq!(server.counters.refused_denied.get(), 2);
+    assert!(server.checks().await.is_empty(), "the push service was asked nothing");
+    // Somebody else, and a request nobody signed: as before.
+    assert_eq!(server.ask(&alice, "PUT", DEVICE, Some(registration())).await.status, 200);
+    let unsigned = server.send("PUT", DEVICE, None, registration().to_string().into_bytes()).await;
+    assert_eq!(code(&unsigned), "auth_missing");
+
+    // Lifted: the file without the key, looked at again.
+    std::fs::write(&file, "").unwrap();
+    assert_eq!(server.denied.refresh(), vpush_proto::denied::Refreshed::Loaded(0));
+    let put = server.ask(&mallory, "PUT", DEVICE, Some(registration())).await;
+    assert_eq!(put.status, 200, "{}", put.body);
+    // Denied again: refused at once on the next look.
+    std::fs::write(&file, format!("{}\n", mallory.public_key().to_hex())).unwrap();
+    server.denied.refresh();
+    assert_eq!(code(&server.ask(&mallory, "PUT", DEVICE, Some(registration())).await), "key_denied");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_file_of_denied_keys_is_beside_the_database_unless_named() {
+    let c = Config::parse("public_url = \"https://push.example.org\"\n[store]\npath = \"/srv/vpush/vpush.db\"\n").unwrap();
+    assert_eq!(c.denied_keys_path(), std::path::Path::new("/srv/vpush/denied-keys.txt"));
+    let c = Config::parse("public_url = \"https://push.example.org\"\ndenied_keys_file = \"/opt/vpush/data/denied.txt\"\n").unwrap();
+    assert_eq!(c.denied_keys_path(), std::path::Path::new("/opt/vpush/data/denied.txt"));
+    assert!(Config::parse("public_url = \"https://push.example.org\"\ndenied_keys_file = \"denied.txt\"\n").is_err(), "an absolute path");
 }

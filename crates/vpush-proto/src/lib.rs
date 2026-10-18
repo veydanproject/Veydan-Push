@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod denied;
+
 /// Answer of `GET /healthz`, and of `vpush ctl health`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Health {
@@ -56,6 +58,9 @@ pub enum ErrorCode {
     LimitDevicesTotal,
     /// Too many requests; `Retry-After` says when to come back.
     RateLimited,
+    /// The key that signed is denied on every server of the network
+    /// (Veydan Cloud): no device of it is registered.
+    KeyDenied,
 }
 
 /// Body of every non-2xx answer.
@@ -353,6 +358,11 @@ pub struct Payload {
     /// Id of this push in the server's log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<String>,
+    /// The event carries an invitation to a call, as its author marked it
+    /// on the outside (`["call", "1"]`): the device opens it even when it
+    /// would say nothing of a message. `"1"` in the string form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub call: bool,
 }
 
 impl Payload {
@@ -367,6 +377,7 @@ impl Payload {
             count: None,
             data: None,
             trace: None,
+            call: false,
         }
     }
 
@@ -407,6 +418,9 @@ impl Payload {
         if let Some(count) = self.count {
             out.insert("count".to_string(), count.to_string());
         }
+        if self.call {
+            out.insert("call".to_string(), "1".to_string());
+        }
         out
     }
 }
@@ -422,6 +436,7 @@ mod tests {
         p.relay = Some("wss://r".into());
         p.group_id = Some("g1".into());
         p.count = Some(3);
+        p.call = true;
 
         let json = serde_json::to_value(&p).unwrap();
         let data = p.to_data();
@@ -431,6 +446,9 @@ mod tests {
         assert_eq!(data["type"], "group");
         assert_eq!(data["count"], "3");
         assert_eq!(data["v"], "2");
+        assert_eq!(data["call"], "1");
+        assert_eq!(json["call"], true);
+        assert!(!Payload::new(PushType::Dm).to_data().contains_key("call"), "a message is not marked");
     }
 
     #[test]
@@ -478,6 +496,7 @@ mod tests {
             (ErrorCode::LimitDevices, "limit_devices"),
             (ErrorCode::LimitDevicesTotal, "limit_devices_total"),
             (ErrorCode::RateLimited, "rate_limited"),
+            (ErrorCode::KeyDenied, "key_denied"),
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), word);
         }

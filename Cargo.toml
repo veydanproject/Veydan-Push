@@ -1,13 +1,15 @@
-# VPush (Veydan Push): push notification server for Nostr relays.
+# VPush (Veydan Push): push notification server for Nostr relays; and
+# VGuard (crates/vguard), the read policy in front of a relay, here for the
+# nostr and WebSocket stack it shares with VPush.
 #
 # Self-contained on purpose: no path dependency leaves this folder, so the
 # whole thing moves to its own repository by moving the folder.
 [workspace]
 resolver = "2"
-members = ["crates/vpush-proto", "crates/vpush-server", "crates/vpush"]
+members = ["crates/vpush-proto", "crates/vpush-server", "crates/vpush", "crates/vguard"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 publish = false
 authors = ["Veydan Project"]
@@ -43,6 +45,8 @@ nostr = { version = "0.45", default-features = false, features = ["std", "os-rng
 # the server reaches it through one module (watch/relay.rs).
 nostr-sdk = { version = "=0.45.4", default-features = false, features = ["ring", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# The WebSocket of vguard, both ways: the version nostr-sdk brings already.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
 
 [profile.release]

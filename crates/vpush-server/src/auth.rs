@@ -39,6 +39,15 @@ pub enum AuthError {
     Busy(Duration),
 }
 
+/// A request whose signature, address, method and body are right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    /// The key that signed it, as 64 hex characters.
+    pub pubkey: String,
+    /// The id of the event: what [`Nip98::remember`] takes.
+    pub event: [u8; 32],
+}
+
 /// Checks requests, and remembers the events it has seen for as long as they
 /// could be used again.
 pub struct Nip98 {
@@ -68,7 +77,8 @@ impl Nip98 {
         format!("{}{}", self.public_url, path_and_query)
     }
 
-    /// The key that signed the request, as 64 hex characters.
+    /// The key that signed the request, as 64 hex characters, with the
+    /// event used up.
     ///
     /// `now` is unix seconds by the server's clock.
     pub fn check(
@@ -79,6 +89,24 @@ impl Nip98 {
         body: &[u8],
         now: u64,
     ) -> Result<String, AuthError> {
+        let verified = self.verify(header, method, path_and_query, body, now)?;
+        self.remember(verified.event)?;
+        Ok(verified.pubkey)
+    }
+
+    /// The same check, but the event is not remembered: the caller does it
+    /// with [`Nip98::remember`] once the request has shown it is worth a
+    /// place in the memory (the device is the signer's, the registration is
+    /// valid). Anybody can sign a request with a key made a moment ago, and
+    /// what costs nothing to make must not fill what is shared.
+    pub fn verify(
+        &self,
+        header: Option<&str>,
+        method: &str,
+        path_and_query: &str,
+        body: &[u8],
+        now: u64,
+    ) -> Result<Verified, AuthError> {
         let header = header.ok_or(AuthError::Missing)?;
         if header.len() > MAX_HEADER {
             return Err(AuthError::Invalid("the header is too long".into()));
@@ -129,10 +157,15 @@ impl Nip98 {
             }
         }
 
-        // Last, so that a request refused for another reason does not use
-        // the event up.
-        self.use_once(event.id.to_bytes(), Instant::now())?;
-        Ok(event.pubkey.to_hex())
+        Ok(Verified {
+            pubkey: event.pubkey.to_hex(),
+            event: event.id.to_bytes(),
+        })
+    }
+
+    /// Uses the event up: a second request with it is a replay.
+    pub fn remember(&self, event: [u8; 32]) -> Result<(), AuthError> {
+        self.use_once(event, Instant::now())
     }
 
     fn use_once(&self, id: [u8; 32], now: Instant) -> Result<(), AuthError> {
@@ -322,6 +355,21 @@ mod tests {
         let header = Signed::new("GET", b"").header(&keys);
         assert!(check(&auth, &header, "DELETE", b"").is_err());
         check(&auth, &header, "GET", b"").unwrap();
+    }
+
+    #[test]
+    fn a_verified_event_is_used_up_only_when_remembered() {
+        let keys = Keys::generate();
+        let auth = Nip98::new(BASE);
+        let header = Signed::new("GET", b"").header(&keys);
+        let verify = || auth.verify(Some(&header), "GET", PATH, b"", NOW);
+        // Verified as often as asked: nothing is taken from the memory.
+        let first = verify().unwrap();
+        assert_eq!(verify().unwrap(), first);
+        assert_eq!(first.pubkey, keys.public_key().to_hex());
+        assert_eq!(auth.remember(first.event), Ok(()));
+        assert_eq!(auth.remember(first.event), Err(AuthError::Replay));
+        assert_eq!(check(&auth, &header, "GET", b""), Err(AuthError::Replay));
     }
 
     /// The id of an event nobody signed: `use_once` does not look further.

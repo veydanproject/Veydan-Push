@@ -3,6 +3,85 @@
 Versions of VPush are its own and do not follow the app. Tags are
 `v<version>`.
 
+## 0.4.0 — the invitation to a call
+
+- The release carries VGuard: `vguard-linux-x86_64` and
+  `vguard-linux-aarch64` beside the binaries of `vpush`, in the same
+  `SHA256SUMS`, each signed by the release key as the component `vguard`
+  (`vguard-linux-<arch>.sig`). The kit of Veydan-Server takes it from
+  here, and puts up no relay without it.
+- VGuard (`crates/vguard`, the binary `vguard`), the read policy of a
+  relay of the network: a WebSocket proxy between nginx and strfry that
+  passes every frame on, but answers itself a REQ, COUNT or NEG-OPEN for
+  gift wraps of a key the connection did not sign in with (NIP-42), for
+  events of groups without `#h`, or with no filter worth the name. The
+  other relays and VPush come with the key of the peers and read
+  everything. `spec/vguard.md`. `scripts/build-release.sh` builds it
+  beside `vpush` (`dist/vguard`), and `make build-deploy` puts it into
+  the kit of a server.
+- VGuard before its first install on the relays, for the apps already
+  released: an AUTH may be 3 days from the clock of the relay
+  (`auth_skew_secs`, was 10 minutes), so a phone with a wrong clock still
+  signs in and gets its messages; a challenge signs in once, so the same
+  AUTH sent again on the connection is refused. A question for gift wraps
+  sent after the challenge but before the AUTH (the app's history, as the
+  connection opens) waits for the AUTH up to `auth_wait_ms` (5 s) and is
+  answered after it, instead of `auth-required`, which sent the app to a
+  plain REQ capped at strfry's newest 500 events; what the client sends
+  meanwhile is held behind it in order (32 frames or 1 MiB at most), the
+  AUTH alone goes ahead. `spec/vguard.md`, "Signing in".
+- Denied keys (Veydan Cloud, the owner's ban of a key on every server of
+  the network): `denied-keys.txt`, one key a line, laid by the agent of
+  vcloud and read again when it changes (once a minute at most). VGuard
+  (`denied_keys_file`) refuses the AUTH of such a key (`restricted: key
+  denied`) and every EVENT it signed (`blocked: key denied`), answers a
+  question for its events alone as empty and drops its events on their
+  way from strfry; VPush (`denied_keys_file`, by default beside the
+  database) refuses its requests with `403 key_denied`. No file, nobody
+  denied: a server without one works as before. `spec/vguard.md`,
+  `spec/protocol.md`, `spec/operations.md`.
+- Closed groups (Veydan Cloud, the owner's closing of a group on the
+  relays of the network after a report on it): `denied-groups.txt`, one
+  id of a group a line, beside `denied-keys.txt` and read again the same
+  way. VGuard (`denied_groups_file`) answers a question for the events of
+  closed groups alone as empty, takes the closed ids out of a question
+  that names open groups too, refuses every EVENT with an `h` of a closed
+  group (`blocked: group denied`) and drops such events on their way from
+  strfry; a sync of closed groups alone is refused. No file, no group
+  closed. `spec/vguard.md`, "Denied groups".
+- `spec/protocol.md` says what a relay learns from VPush: the list of
+  keys and groups it watches there.
+- Anonymous requests can no longer fill the memory of used signatures and
+  lock everybody out: a signed event is remembered only once the request
+  reached a device of its signer (or a valid registration), and every
+  request to a device is limited to 120 a minute from one address (a /64 of
+  IPv6), when `server.trusted_proxy` is on. `spec/protocol.md`,
+  `spec/operations.md`.
+- Parallel registrations cannot pass `devices_per_pubkey` and
+  `devices_total`: the transaction takes the write lock first (`BEGIN
+  IMMEDIATE`), and a limit is said as a limit, not as `internal`.
+- `devices-forget` makes the watcher read the plan at once, so the relays
+  stop asking for the forgotten owner without waiting for the minute.
+- `vpush ctl devices-forget <owner>` (the admin request `devices_forget`)
+  forgets every device of one owner at once, with their relays and groups:
+  the step `push.forget` of the deletion of an account of Veydan Cloud,
+  which the agent of vcloud runs. The answer says how many went.
+- A gift wrap with `["call", "1"]` on its outside (the invitation to a
+  call of the messenger) is pushed at once, past the throttle of the chat
+  and the cap of the device, with a `ttl` of a minute and the collapse key
+  `call`. The push is otherwise a `dm` push with `call` set to `"1"`; the
+  phone opens it and finds the call. `spec/protocol.md`, "What an app
+  writes on its events".
+- A device is rung for no more than `[pipeline] call_cap` calls within
+  `call_window_secs` (6 in 60 by default): the tag is anyone's to put on
+  a wrap. What comes over that is dropped.
+- `["call", "0"]`, the end of a ringing (the call was taken on another
+  device, declined, or given up), is pushed the same way: at once, for a
+  minute, and the phone opens it and stops ringing. It has a collapse key
+  of its own, `call_end`, so that the end of one call never takes the
+  place of the waiting ring of another. The ends are on a budget of their
+  own, with the cap of the rings. `spec/protocol.md`, `["call", "0"]`.
+
 ## 0.3.1 — the source is public
 
 The server is the same as in 0.3.0; this release opens its source.
