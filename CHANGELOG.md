@@ -3,6 +3,13 @@
 Versions of VPush are its own and do not follow the app. Tags are
 `v<version>`.
 
+## 0.5.1 — tokio 1.54.1, ctutils 0.4.5
+
+- `tokio` 1.54.1 (RUSTSEC-2026-0386: the constructors of `AsyncFd` that took
+  any raw descriptor violate I/O safety; neither VPush nor vguard builds an
+  `AsyncFd`) and `ctutils` 0.4.5 (RUSTSEC-2026-0385: masks not made in
+  constant time). Nothing else changed.
+
 ## 0.5.0 — the gateway: a push for a server of one's own
 
 - The gateway (`spec/protocol.md`, "The gateway"): a push for a server of

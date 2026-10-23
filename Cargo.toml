@@ -9,7 +9,7 @@ resolver = "2"
 members = ["crates/vpush-proto", "crates/vpush-server", "crates/vpush", "crates/vguard"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 publish = false
 authors = ["Veydan Project"]

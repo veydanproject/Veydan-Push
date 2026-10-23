@@ -106,7 +106,7 @@ copy of the server, next to its binary. It lists every crate of
 | crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 |
 | crypto-common | 0.2.2 | MIT OR Apache-2.0 |
-| ctutils | 0.4.2 | Apache-2.0 OR MIT |
+| ctutils | 0.4.5 | Apache-2.0 OR MIT |
 | data-encoding | 2.11.1 | MIT |
 | deadpool | 0.12.3 | MIT OR Apache-2.0 |
 | deadpool-runtime | 0.1.4 | MIT OR Apache-2.0 |
@@ -253,7 +253,7 @@ copy of the server, next to its binary. It lists every crate of
 | rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 |
 | rustls-platform-verifier | 0.7.1 | MIT OR Apache-2.0 |
 | rustls-platform-verifier-android | 0.2.0 | MIT OR Apache-2.0 |
-| rustls-webpki | 0.103.15 | ISC |
+| rustls-webpki | 0.103.16 | ISC |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 |
 | ryu | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | same-file | 1.0.6 | Unlicense OR MIT |
@@ -306,7 +306,7 @@ copy of the server, next to its binary. It lists every crate of
 | thread_local | 1.1.10 | MIT OR Apache-2.0 |
 | tinystr | 0.8.4 | Unicode-3.0 |
 | tinyvec | 1.13.3 | Zlib OR Apache-2.0 OR MIT |
-| tokio | 1.53.1 | MIT |
+| tokio | 1.54.1 | MIT |
 | tokio-happy-eyeballs | 0.1.0 | MIT |
 | tokio-macros | 2.7.2 | MIT |
 | tokio-rustls | 0.26.6 | MIT OR Apache-2.0 |
@@ -358,7 +358,7 @@ copy of the server, next to its binary. It lists every crate of
 | web-time | 1.1.0 | MIT OR Apache-2.0 |
 | webpki-root-certs | 1.0.9 | CDLA-Permissive-2.0 |
 | webpki-roots | 0.26.11 | CDLA-Permissive-2.0 |
-| webpki-roots | 1.0.9 | CDLA-Permissive-2.0 |
+| webpki-roots | 1.0.10 | CDLA-Permissive-2.0 |
 | whoami | 2.1.3 | Apache-2.0 OR BSL-1.0 OR MIT |
 | winapi-util | 0.1.11 | Unlicense OR MIT |
 | windows_aarch64_gnullvm | 0.52.6 | MIT OR Apache-2.0 |
