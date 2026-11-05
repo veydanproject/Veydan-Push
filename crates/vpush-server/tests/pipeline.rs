@@ -860,6 +860,68 @@ async fn a_burst_wakes_the_phone_twice_and_the_second_push_counts_the_rest() {
     assert_ne!(carried(at_once)["id"], named, "and not the one pushed at once");
 }
 
+#[tokio::test]
+async fn a_channel_note_and_a_message_use_separate_push_lanes() {
+    let r = relay().await;
+    let server = server(&[&r], Duration::from_secs(2)).await;
+    let owner = Keys::generate();
+    server.register(&owner, "phone", &[&r]).await;
+    server.watching(&owner, &[&r]).await;
+
+    let note = wrap(&owner, &[&["channel", "1"]]);
+    let message = wrap(&owner, &[]);
+    let started = Instant::now();
+    r.publish(&note).await;
+    r.publish(&message).await;
+    let pushes = server.pushes_are(2).await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let channel = pushes.iter().find(|p| p["data"]["channel"] == "1").unwrap();
+    let dm = pushes.iter().find(|p| p["data"].get("channel").is_none()).unwrap();
+    assert_eq!(channel["data"]["type"], "dm");
+    assert_eq!(carried(&channel["data"])["id"], note.id.to_hex());
+    assert_eq!(carried(&dm["data"])["id"], message.id.to_hex());
+    assert!(channel["data"].get("count").is_none());
+    assert!(dm["data"].get("count").is_none());
+    assert_ne!(channel["android"]["collapse_key"], dm["android"]["collapse_key"]);
+}
+
+#[tokio::test]
+async fn three_channel_notes_count_only_channel_notes() {
+    let r = relay().await;
+    let server = server(&[&r], Duration::from_secs(2)).await;
+    let owner = Keys::generate();
+    server.register(&owner, "phone", &[&r]).await;
+    server.watching(&owner, &[&r]).await;
+
+    for _ in 0..3 {
+        r.publish(&wrap(&owner, &[&["channel", "1"]])).await;
+    }
+    let pushes = server.pushes_are(2).await;
+    assert!(pushes.iter().all(|p| p["data"]["type"] == "dm" && p["data"]["channel"] == "1"));
+    let first = pushes.iter().find(|p| p["data"].get("count").is_none()).unwrap();
+    let counted = pushes.iter().find(|p| p["data"]["count"] == "2").unwrap();
+    assert_eq!(first["android"]["collapse_key"], counted["android"]["collapse_key"]);
+    assert!(counted["data"].get("event").is_none());
+}
+
+#[tokio::test]
+async fn ordinary_messages_still_share_one_push_lane() {
+    let r = relay().await;
+    let server = server(&[&r], Duration::from_secs(2)).await;
+    let owner = Keys::generate();
+    server.register(&owner, "phone", &[&r]).await;
+    server.watching(&owner, &[&r]).await;
+
+    for _ in 0..2 {
+        r.publish(&wrap(&owner, &[])).await;
+    }
+    let pushes = server.pushes_are(2).await;
+    assert!(pushes.iter().all(|p| p["data"]["type"] == "dm" && p["data"].get("channel").is_none()));
+    assert!(pushes.iter().all(|p| p["data"].get("count").is_none()));
+    assert_eq!(pushes.iter().filter(|p| p["data"].get("event").is_some()).count(), 2);
+    assert_eq!(pushes[0]["android"]["collapse_key"], pushes[1]["android"]["collapse_key"]);
+}
+
 /// An invitation to a call (`["call", "1"]` on the outside) is pushed at
 /// once, however recently the chat woke the phone, lives a minute at the
 /// push service and replaces the call before it; the push is otherwise a

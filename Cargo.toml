@@ -1,15 +1,17 @@
-# VPush (Veydan Push): push notification server for Nostr relays; and
-# VGuard (crates/vguard), the read policy in front of a relay, here for the
-# nostr and WebSocket stack it shares with VPush.
+# VPush (Veydan Push): push notification server for Nostr relays. (VGuard,
+# the read policy in front of a relay, was here until 0.5.1; since 0.6.0 it
+# is services/guard, Veydan-Guard.)
 #
-# Self-contained on purpose: no path dependency leaves this folder, so the
-# whole thing moves to its own repository by moving the folder.
+# Built on one crate of services/common (Veydan-Common): veydan-denied, the
+# keys the network denies, read here and by VGuard and VCloud alike. That is
+# the one path dependency that leaves this folder; a snapshot takes it from
+# Veydan-Common by tag.
 [workspace]
 resolver = "2"
-members = ["crates/vpush-proto", "crates/vpush-server", "crates/vpush", "crates/vguard"]
+members = ["crates/vpush-proto", "crates/vpush-server", "crates/vpush"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 publish = false
 authors = ["Veydan Project"]
@@ -18,6 +20,7 @@ authors = ["Veydan Project"]
 license-file = "LICENSE"
 
 [workspace.dependencies]
+veydan-denied = { git = "https://github.com/veydanproject/Veydan-Common", tag = "v0.1.0" }
 vpush-proto = { path = "crates/vpush-proto" }
 vpush-server = { path = "crates/vpush-server" }
 
@@ -43,10 +46,8 @@ async-trait = "0.1"
 nostr = { version = "0.45", default-features = false, features = ["std", "os-rng"] }
 # The API of nostr-sdk changes with every release: the version is pinned, and
 # the server reaches it through one module (watch/relay.rs).
-nostr-sdk = { version = "=0.45.4", default-features = false, features = ["ring", "rustls-tls-webpki-roots"] }
+nostr-sdk = { version = "=0.45.6", default-features = false, features = ["ring", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# The WebSocket of vguard, both ways: the version nostr-sdk brings already.
-tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake"] }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "migrate", "macros"] }
 
 [profile.release]

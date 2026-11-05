@@ -309,6 +309,7 @@ push is shown the same way, with a line of the device's own.
 | `data` | service pushes | A JSON string; its meaning depends on `type` |
 | `trace` | always | Id of this push in the server's log |
 | `call` | `dm`, when the wrap is marked as a call | `"1"`: the event carries an invitation to a call, or the end of one, as its author marked it on the outside (see `["call", "1"]` and `["call", "0"]`); the device opens it even when it shows no content of messages, rings for it when it is a call indeed, and stops ringing when it is the end of one |
+| `channel` | `dm`, when the kind 1059 wrap has `["channel", "1"]` | `"1"`: a channel service note; absent for an ordinary message. The device handles it without a message sound |
 | `check` | `test`, at a private push server, when it asks about a ticket | `"1"`: the push is the question of a registration ([The token is checked](#the-token-is-checked)); the device shows nothing for it |
 
 ### The event, or where to find it
@@ -350,12 +351,17 @@ the silent one: the device handles it and shows nothing.
 `count` is present when the push stands for more than one event: the device
 was woken about this chat a moment ago, and what came since was counted.
 For direct messages the count is of all senders together.
+Channel service notes have a separate count from ordinary direct messages.
 
 ### One notification per chat
 
 A push about a chat replaces the one before it. Tell chats apart the way the
 server does: all direct messages are one chat, since the server cannot tell
 senders apart, and every group is a chat of its own.
+Kind 1059 wraps marked `["channel", "1"]` share a separate channel lane:
+their throttle and `collapse_key` do not replace or count ordinary `dm`
+pushes. The push type remains `dm`, including the counted push for this lane;
+both carry `channel: "1"`.
 
 ### Thirty pushes a minute, and one that counts the rest
 

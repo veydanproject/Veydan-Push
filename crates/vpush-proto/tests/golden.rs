@@ -121,6 +121,13 @@ fn pushes() {
     assert_eq!(event["kind"], 1059);
     assert!(dm.event_id.is_none() && dm.relay.is_none(), "one form or the other");
 
+    let keeper: Payload = round_trip("push_dm_keeper.json");
+    assert_eq!(keeper.kind, PushType::Dm);
+    assert!(keeper.channel);
+    assert_eq!(keeper.to_data()["channel"], "1");
+    let note: Value = serde_json::from_str(keeper.event.as_deref().unwrap()).unwrap();
+    assert!(note["tags"].as_array().unwrap().contains(&serde_json::json!(["channel", "1"])));
+
     // Several events: the last of them is named, and taken from the relay.
     let group: Payload = round_trip("push_group.json");
     assert_eq!(group.kind, PushType::Group);

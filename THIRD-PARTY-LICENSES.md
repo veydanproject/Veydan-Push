@@ -206,7 +206,7 @@ copy of the server, next to its binary. It lists every crate of
 | nostr-database | 0.45.2 | MIT |
 | nostr-gossip | 0.45.1 | MIT |
 | nostr-memory | 0.45.2 | MIT |
-| nostr-sdk | 0.45.4 | MIT |
+| nostr-sdk | 0.45.6 | MIT |
 | nu-ansi-term | 0.50.3 | MIT |
 | num_cpus | 1.17.0 | MIT OR Apache-2.0 |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 |

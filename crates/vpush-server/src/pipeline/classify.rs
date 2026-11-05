@@ -18,6 +18,8 @@ pub const TAG_AUTHOR: &str = "vp";
 pub const TAG_GROUP: &str = "gp";
 /// A call: the phone rings for it now or never (`messenger-dm::wrap`).
 pub const TAG_CALL: &str = "call";
+/// A service note for a channel, on the outside of a gift wrap.
+pub const TAG_CHANNEL: &str = "channel";
 
 /// How many marks of its group are read off one event. An app puts one, or
 /// two for a week after the key of the group changed; whatever comes after
@@ -111,6 +113,11 @@ pub fn call_mark(event: &Event) -> Option<CallMark> {
 /// The author marked the event as a call, a ring or an end of one.
 pub fn is_call(event: &Event) -> bool {
     call_mark(event).is_some()
+}
+
+/// Channel notes have their own push lane. Group events cannot use this mark.
+pub fn is_channel(event: &Event) -> bool {
+    event.kind.as_u16() == KIND_WRAP && values(event, TAG_CHANNEL).any(|value| value == "1")
 }
 
 /// The mark of the author on a group event.
@@ -233,6 +240,15 @@ mod tests {
         assert!(!is_call(&event(1059, &[&["p", &a]])));
         assert!(!is_call(&event(1059, &[&["p", "call"]])));
         assert!(!is_call(&event(9, &[&["h", &a], &["call", "1"]])), "a group event is not a call");
+    }
+
+    #[test]
+    fn a_channel_mark_only_applies_to_a_wrap() {
+        let a = "aa".repeat(32);
+        assert!(is_channel(&event(1059, &[&["p", &a], &["channel", "1"]])));
+        assert!(!is_channel(&event(1059, &[&["p", &a], &["channel", "0"]])));
+        assert!(!is_channel(&event(1059, &[&["p", &a]])));
+        assert!(!is_channel(&event(9, &[&["h", &a], &["channel", "1"]])));
     }
 
     /// `1` rings, `0` ends a ringing, and a value this server does not

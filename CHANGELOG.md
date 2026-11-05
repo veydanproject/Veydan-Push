@@ -3,6 +3,19 @@
 Versions of VPush are its own and do not follow the app. Tags are
 `v<version>`.
 
+## 0.6.0 — VGuard in a repository of its own
+
+- VGuard, the read policy of a relay, leaves this repository: since 0.6.0
+  it is [Veydan-Guard](https://github.com/veydanproject/Veydan-Guard)
+  (`vguard` 0.6.0, the numbers continue), with its specification. The
+  release of VPush carries `vpush-linux-x86_64` and `vpush-linux-aarch64`
+  alone; the kit of Veydan-Server takes `vguard-linux-<arch>` from the
+  release of Veydan-Guard. Nothing of VPush itself changed by it: the
+  WebSocket crate of the guard is gone from the lock, that is all.
+- Channel service notes marked `["channel", "1"]` use a separate throttle
+  and collapse key from direct messages. Their `dm` push carries optional
+  `channel: "1"`, including counted pushes, so the phone can keep them quiet.
+
 ## 0.5.1 — tokio 1.54.1, ctutils 0.4.5
 
 - `tokio` 1.54.1 (RUSTSEC-2026-0386: the constructors of `AsyncFd` that took

@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use tower_http::timeout::TimeoutLayer;
-use vpush_proto::denied::{DeniedKeys, Refreshed, RELOAD_EVERY};
+use veydan_denied::{DeniedKeys, Refreshed, RELOAD_EVERY};
 use vpush_proto::{AppInfo, ErrorBody, ErrorCode, ErrorDetail, Info, Limits, TicketsInfo};
 
 use crate::auth::Nip98;

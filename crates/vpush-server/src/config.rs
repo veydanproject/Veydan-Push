@@ -322,7 +322,7 @@ impl Config {
     pub fn denied_keys_path(&self) -> PathBuf {
         match &self.denied_keys_file {
             Some(path) => path.clone(),
-            None => self.store.path.parent().unwrap_or_else(|| Path::new(".")).join(vpush_proto::denied::FILE_NAME),
+            None => self.store.path.parent().unwrap_or_else(|| Path::new(".")).join(veydan_denied::FILE_NAME),
         }
     }
 

@@ -328,6 +328,9 @@ mod tests {
         let t = Throttle::new(WINDOW);
         let now = Instant::now();
         assert_eq!(event(&t, "dm", now, 1), Verdict::Now);
+        assert_eq!(event(&t, "channel", now, 1), Verdict::Now);
+        assert_eq!(event(&t, "channel", now, 2), Verdict::Later { wake_in: Some(WINDOW) });
+        assert_eq!(event(&t, "dm", now, 2), Verdict::Later { wake_in: Some(WINDOW) });
         assert_eq!(event(&t, "group:1", now, 1), Verdict::Now);
         assert_eq!(
             t.event(&("owner".into(), "tablet".into(), "dm".into()), now, named(1)),

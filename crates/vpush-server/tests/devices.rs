@@ -32,7 +32,7 @@ struct Server {
     counters: Arc<Counters>,
     google: MockServer,
     /// The denied keys the server reads, to look at its file again.
-    denied: Arc<vpush_proto::denied::DeniedKeys>,
+    denied: Arc<veydan_denied::DeniedKeys>,
 }
 
 /// What marks the request that asks FCM about a token and sends nothing.
@@ -1118,7 +1118,7 @@ async fn a_denied_key_registers_nothing_and_the_file_is_read_again() {
 
     // Lifted: the file without the key, looked at again.
     std::fs::write(&file, "").unwrap();
-    assert_eq!(server.denied.refresh(), vpush_proto::denied::Refreshed::Loaded(0));
+    assert_eq!(server.denied.refresh(), veydan_denied::Refreshed::Loaded(0));
     let put = server.ask(&mallory, "PUT", DEVICE, Some(registration())).await;
     assert_eq!(put.status, 200, "{}", put.body);
     // Denied again: refused at once on the next look.

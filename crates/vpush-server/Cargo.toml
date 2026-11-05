@@ -10,6 +10,7 @@ build = "build.rs"
 
 [dependencies]
 vpush-proto = { workspace = true }
+veydan-denied = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

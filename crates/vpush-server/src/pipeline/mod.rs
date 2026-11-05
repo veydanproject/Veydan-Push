@@ -130,7 +130,7 @@ pub struct Pipeline {
 /// A push on its way out: what is sent, to whom, and what the log says of it.
 struct Parcel {
     trace: String,
-    /// `dm`, `group`, `sync`; `call` for a direct message marked as a call,
+    /// `dm`, `channel`, `group`, `sync`; `call` for a direct message marked as a call,
     /// `call_end` for one marked as the end of a ringing.
     kind: &'static str,
     /// The relay the event came from. A `sync` push is about no one event.
@@ -151,6 +151,7 @@ struct Order {
     /// fits. Shared by the orders of every recipient of the event.
     event: Arc<str>,
     subject: Subject,
+    channel: bool,
     to: Recipient,
 }
 
@@ -158,6 +159,7 @@ impl Order {
     /// What the push is about, as the throttle and the phone tell chats apart.
     fn chat(&self) -> String {
         match &self.subject {
+            Subject::Dm { .. } if self.channel => "channel".to_string(),
             Subject::Dm { .. } => "dm".to_string(),
             Subject::Group { id } => format!("group:{id}"),
         }
@@ -322,6 +324,7 @@ impl Pipeline {
                 event_id: id.clone(),
                 event: Arc::clone(&json),
                 subject: subject.clone(),
+                channel: classify::is_channel(event),
                 to,
             };
             if let Some(mark) = call {
@@ -434,7 +437,7 @@ impl Pipeline {
                 self.send(Parcel {
                     message: Self::message(&order, count),
                     trace: order.trace,
-                    kind: order.subject.kind(),
+                    kind: if order.channel { "channel" } else { order.subject.kind() },
                     relay: Some(order.relay),
                     to: order.to,
                     count,
@@ -511,6 +514,7 @@ impl Pipeline {
         payload.count = (count > 1).then_some(count);
         payload.trace = Some(order.trace.clone());
         payload.call = call;
+        payload.channel = order.channel;
 
         let mut by_id = payload.clone();
         by_id.event_id = Some(order.event_id.clone());

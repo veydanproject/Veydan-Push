@@ -5,7 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-pub mod denied;
 
 /// Answer of `GET /healthz`, and of `vpush ctl health`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,6 +486,10 @@ pub struct Payload {
     /// would say nothing of a message. `"1"` in the string form.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub call: bool,
+    /// A channel service note (`["channel", "1"]` on a gift wrap).
+    /// `"1"` in the string form; absent for ordinary messages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub channel: bool,
     /// A `test` push sent to check the ticket of a device that has just
     /// registered at a private push server: the device shows nothing for
     /// it. `"1"` in the string form.
@@ -514,6 +517,7 @@ impl Payload {
             data: None,
             trace: None,
             call: false,
+            channel: false,
             check: false,
             blob: None,
             sender: None,
@@ -562,6 +566,9 @@ impl Payload {
         if self.call {
             out.insert("call".to_string(), "1".to_string());
         }
+        if self.channel {
+            out.insert("channel".to_string(), "1".to_string());
+        }
         if self.check {
             out.insert("check".to_string(), "1".to_string());
         }
@@ -581,6 +588,7 @@ mod tests {
         p.group_id = Some("g1".into());
         p.count = Some(3);
         p.call = true;
+        p.channel = true;
         p.check = true;
 
         let json = serde_json::to_value(&p).unwrap();
@@ -592,9 +600,12 @@ mod tests {
         assert_eq!(data["count"], "3");
         assert_eq!(data["v"], "2");
         assert_eq!(data["call"], "1");
+        assert_eq!(data["channel"], "1");
+        assert_eq!(json["channel"], true);
         assert_eq!(json["call"], true);
         assert_eq!((data["check"].as_str(), &json["check"]), ("1", &serde_json::json!(true)));
         assert!(!Payload::new(PushType::Dm).to_data().contains_key("call"), "a message is not marked");
+        assert!(!Payload::new(PushType::Dm).to_data().contains_key("channel"));
     }
 
     #[test]
@@ -671,6 +682,7 @@ mod tests {
     fn payload_reads_back() {
         let mut p = Payload::new(PushType::Dm);
         p.event = Some(r#"{"kind":1059}"#.into());
+        p.channel = true;
         let back: Payload = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(back, p);
     }
