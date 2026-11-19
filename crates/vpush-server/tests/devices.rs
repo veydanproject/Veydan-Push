@@ -1206,3 +1206,52 @@ async fn a_device_of_apns_is_registered_with_its_environment_and_pushed_to() {
     assert_eq!(body["trace"], test.body["trace"]);
     assert_eq!(body["aps"]["mutable-content"], 1);
 }
+
+/// An iPhone may give its PushKit token beside its device token, as the
+/// example in `golden` does: kept beside the channel, hex like the token,
+/// and dropped by a registration without it.
+#[tokio::test]
+async fn an_iphone_registers_its_voip_token_beside_its_token() {
+    let server = start().await;
+    let alice = Keys::generate();
+    let path = format!("{}/../../golden/device_put_apns.json", env!("CARGO_MANIFEST_DIR"));
+    let mut example: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    example["app_id"] = json!(IOS);
+    let (token, voip) = (
+        example["channel"]["token"].as_str().unwrap().to_string(),
+        example["channel"]["voip_token"].as_str().unwrap().to_string(),
+    );
+    let stored = || async {
+        server.store.device(&alice.public_key().to_hex(), "phone-0001").await.unwrap()
+    };
+
+    for (what, bad) in [
+        ("not hex", json!("not/a/token")),
+        ("empty", json!("")),
+        ("too long", json!("ab".repeat(4096))),
+        ("not a string", json!(7)),
+    ] {
+        let mut put = example.clone();
+        put["channel"]["voip_token"] = bad;
+        let answer = server.ask(&alice, "PUT", DEVICE, Some(put)).await;
+        assert_eq!((answer.status, code(&answer)), (400, "bad_request"), "{what}: {}", answer.body);
+        assert!(stored().await.is_none(), "{what}: nothing is kept");
+    }
+
+    let put = server.ask(&alice, "PUT", DEVICE, Some(example.clone())).await;
+    assert_eq!(put.status, 200, "{}", put.body);
+    let kept = stored().await.unwrap();
+    assert_eq!((kept.token.as_str(), kept.voip_token.as_deref(), kept.sandbox), (token.as_str(), Some(voip.as_str()), false));
+
+    // Registered again without it: no VoIP token, the device as it was.
+    let mut without = example.clone();
+    without["channel"].as_object_mut().unwrap().remove("voip_token");
+    let put = server.ask(&alice, "PUT", DEVICE, Some(without)).await;
+    assert_eq!(put.status, 200, "{}", put.body);
+    let kept = stored().await.unwrap();
+    assert_eq!((kept.token.as_str(), kept.voip_token.as_deref(), kept.state.as_str()), (token.as_str(), None, "active"));
+
+    // And with it again.
+    assert_eq!(server.ask(&alice, "PUT", DEVICE, Some(example)).await.status, 200);
+    assert_eq!(stored().await.unwrap().voip_token, Some(voip));
+}

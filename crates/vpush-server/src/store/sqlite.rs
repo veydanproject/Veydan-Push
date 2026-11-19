@@ -171,6 +171,7 @@ impl SqliteStore {
                 .map(|v| v.max(0) as u64),
             seal_to: seal_to(channel.as_deref()),
             sandbox: sandbox(channel.as_deref()),
+            voip_token: voip_token(channel.as_deref()),
             relays,
             groups,
         })
@@ -434,6 +435,42 @@ impl Store for SqliteStore {
             .map_err(db)?;
         }
         Ok(())
+    }
+
+    async fn drop_voip_token(&self, pubkey: &str, device_id: &str, voip_token: &str) -> Result<bool> {
+        let kept: Option<Option<String>> =
+            sqlx::query_scalar("SELECT channel_json FROM devices WHERE pubkey = ? AND device_id = ?")
+                .bind(pubkey)
+                .bind(device_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db)?;
+        let Some(Some(json)) = kept else {
+            return Ok(false);
+        };
+        let Ok(vpush_proto::Channel::Apns { token, environment, voip_token: Some(kept) }) =
+            serde_json::from_str::<vpush_proto::Channel>(&json)
+        else {
+            return Ok(false);
+        };
+        if kept != voip_token {
+            return Ok(false);
+        }
+        let without = serde_json::to_string(&vpush_proto::Channel::Apns { token, environment, voip_token: None })
+            .map_err(db)?;
+        // Only the channel that was read: a registration that came in
+        // between is newer, and what APNs said of the token is no news to it.
+        let done = sqlx::query(
+            "UPDATE devices SET channel_json = ? WHERE pubkey = ? AND device_id = ? AND channel_json = ?",
+        )
+        .bind(&without)
+        .bind(pubkey)
+        .bind(device_id)
+        .bind(&json)
+        .execute(&self.pool)
+        .await
+        .map_err(db)?;
+        Ok(done.rows_affected() > 0)
     }
 
     async fn purge_expired(&self, now: u64) -> Result<u64> {
@@ -973,6 +1010,7 @@ fn recipient(row: &SqliteRow) -> Result<super::Recipient> {
         author_key: row.try_get("author_key").map_err(db)?,
         seal_to: seal_to(channel.as_deref()),
         sandbox: sandbox(channel.as_deref()),
+        voip_token: voip_token(channel.as_deref()),
     })
 }
 
@@ -995,6 +1033,14 @@ fn sandbox(channel_json: Option<&str>) -> bool {
         serde_json::from_str::<vpush_proto::Channel>(json),
         Ok(vpush_proto::Channel::Apns { environment, .. }) if environment == "sandbox"
     )
+}
+
+/// The PushKit token of a device of APNs, from what its channel said.
+fn voip_token(channel_json: Option<&str>) -> Option<String> {
+    match serde_json::from_str::<vpush_proto::Channel>(channel_json?) {
+        Ok(vpush_proto::Channel::Apns { voip_token, .. }) => voip_token,
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -1735,5 +1781,38 @@ mod ticket_tests {
         // A device of FCM is in no sandbox.
         s.put_device(input("cc", "phone-1", "t1"), ROOMY).await.unwrap();
         assert!(!s.dm_recipients("cc", 1500).await.unwrap()[0].sandbox);
+    }
+
+    #[tokio::test]
+    async fn a_dead_voip_token_is_forgotten_and_the_device_stays() {
+        let s = SqliteStore::in_memory().await.unwrap();
+        let token = "0a".repeat(32);
+        let iphone = |voip: &str| {
+            let mut phone = input(ALICE, "phone-1", &token);
+            phone.provider = "apns".into();
+            phone.channel_json = Some(format!(
+                r#"{{"provider":"apns","token":"{token}","environment":"sandbox","voip_token":"{voip}"}}"#
+            ));
+            phone
+        };
+        s.put_device(iphone(&"0b".repeat(32)), ROOMY).await.unwrap();
+        let to = s.dm_recipients(ALICE, 1500).await.unwrap();
+        assert_eq!(to[0].voip_token, Some("0b".repeat(32)));
+        assert_eq!(s.device(ALICE, "phone-1").await.unwrap().unwrap().voip_token, Some("0b".repeat(32)));
+
+        // Another token than the one kept: nothing happens.
+        assert!(!s.drop_voip_token(ALICE, "phone-1", &"0c".repeat(32)).await.unwrap());
+        assert!(s.drop_voip_token(ALICE, "phone-1", &"0b".repeat(32)).await.unwrap());
+        let d = s.device(ALICE, "phone-1").await.unwrap().unwrap();
+        assert_eq!(d.voip_token, None);
+        assert_eq!((d.state.as_str(), d.token.as_str(), d.sandbox), ("active", token.as_str(), true));
+        assert_eq!(s.dm_recipients(ALICE, 1500).await.unwrap().len(), 1, "still pushed to");
+        assert!(!s.drop_voip_token(ALICE, "phone-1", &"0b".repeat(32)).await.unwrap(), "once");
+
+        // A device of FCM has none to drop, and none is unknown.
+        s.put_device(input(BOB, "phone-1", "t1"), ROOMY).await.unwrap();
+        assert_eq!(s.dm_recipients(BOB, 1500).await.unwrap()[0].voip_token, None);
+        assert!(!s.drop_voip_token(BOB, "phone-1", "t1").await.unwrap());
+        assert!(!s.drop_voip_token(BOB, "nobody", "t1").await.unwrap());
     }
 }

@@ -390,3 +390,115 @@ fn the_environment_of_the_device_chooses_the_host() {
     target.sandbox = true;
     assert_eq!(client.host(&target), "https://api.sandbox.push.apple.com");
 }
+
+fn voip_token() -> String {
+    "1e".repeat(32)
+}
+
+/// The invitation to a call, as the pipeline hands it over: a `dm` push
+/// marked `call`, alive for a minute.
+fn ring() -> Message {
+    let mut ring = dm();
+    ring.payload.call = true;
+    if let Some(fallback) = ring.fallback.as_mut() {
+        fallback.call = true;
+    }
+    ring.collapse_key = Some("c411".into());
+    ring.ttl = Duration::from_secs(60);
+    ring
+}
+
+fn pushkit() -> Target {
+    Target {
+        voip: true,
+        ..Target::of(voip_token())
+    }
+}
+
+#[tokio::test]
+async fn a_push_to_a_voip_token_goes_as_voip_to_the_voip_topic() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/3/device/{}", voip_token())))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (client, _) = client(&server);
+
+    let attempt = client.send(&pushkit(), &ring()).await;
+    assert_eq!(attempt.outcome, Outcome::Delivered, "{attempt:?}");
+    let sent = sent(&server).await;
+    assert_eq!(sent.len(), 1);
+    let request = &sent[0];
+    assert_eq!(header(request, "apns-topic"), Some("net.veydan.mobile.voip"));
+    assert_eq!(header(request, "apns-push-type"), Some("voip"));
+    assert_eq!(header(request, "apns-priority"), Some("10"));
+    let expires: u64 = header(request, "apns-expiration").unwrap().parse().unwrap();
+    assert!(expires.abs_diff(unix_now() + 60) <= 2, "{expires}");
+    assert_eq!(header(request, "apns-collapse-id"), None);
+
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body.get("aps").is_none(), "no alert, no badge: the app shows the call");
+    assert_eq!(body["v"], "2");
+    assert_eq!(body["type"], "dm");
+    assert_eq!(body["call"], "1");
+    assert_eq!(body["trace"], "abcd1234");
+    assert_eq!(body["event"], r#"{"id":"e1","kind":1059,"content":"sealed"}"#);
+
+    // Not urgent by itself, the push of a VoIP token is still at once.
+    let mut later = ring();
+    later.urgent = false;
+    client.send(&pushkit(), &later).await;
+    assert_eq!(header(&sent_last(&server).await, "apns-priority"), Some("10"));
+
+    // The same ring to the device token is the alert it always was.
+    answers(&server, ResponseTemplate::new(200)).await;
+    client.send(&Target::of(token()), &ring()).await;
+    let alert = sent_last(&server).await;
+    assert_eq!(alert.url.path(), device());
+    assert_eq!(header(&alert, "apns-topic"), Some(TOPIC));
+    assert_eq!(header(&alert, "apns-push-type"), Some("alert"));
+    let alert: Value = serde_json::from_slice(&alert.body).unwrap();
+    assert_eq!(alert["aps"]["alert"]["loc-key"], "push.new");
+    assert_eq!(alert["call"], "1");
+}
+
+async fn sent_last(server: &MockServer) -> Request {
+    sent(server).await.pop().unwrap()
+}
+
+#[tokio::test]
+async fn a_dead_voip_token_is_dead_and_sandbox_goes_to_the_sandbox() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/3/device/{}", voip_token())))
+        .respond_with(apple(410, "Unregistered"))
+        .mount(&server)
+        .await;
+    let (client, _) = client(&server);
+    let delivery = deliver(&client, &pushkit(), &ring(), fast()).await;
+    assert_eq!(delivery.outcome, Outcome::DeadToken);
+    assert_eq!(delivery.attempts.len(), 1);
+
+    let key = SigningKey::parse(&p8::p8().0).unwrap();
+    let real = ApnsClient::new(key, KEY_ID, TEAM_ID, TOPIC, None).unwrap();
+    let mut sandbox = pushkit();
+    sandbox.sandbox = true;
+    assert_eq!(real.host(&sandbox), "https://api.sandbox.push.apple.com");
+    assert_eq!(real.topic(&sandbox), "net.veydan.mobile.voip");
+    assert_eq!(real.topic(&Target::of(token())), TOPIC);
+}
+
+#[tokio::test]
+async fn a_voip_token_that_is_not_hex_never_reaches_apple() {
+    let server = MockServer::start().await;
+    answers(&server, ResponseTemplate::new(200)).await;
+    let (client, _) = client(&server);
+    let target = Target {
+        voip: true,
+        ..Target::of("../../other")
+    };
+    let a = client.send(&target, &ring()).await;
+    assert_eq!((a.outcome, a.code.as_deref()), (Outcome::Rejected, Some("NOT_A_TOKEN")));
+    assert!(sent(&server).await.is_empty());
+}

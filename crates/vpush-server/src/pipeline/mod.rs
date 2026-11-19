@@ -139,6 +139,11 @@ struct Parcel {
     /// How many events the push stands for.
     count: u32,
     message: Message,
+    /// An invitation to a call: to a device of APNs with a PushKit token it
+    /// goes as a VoIP push. Nothing else does: iOS wants every VoIP push
+    /// reported to CallKit as an incoming call, and stops waking an app
+    /// that does not.
+    ring: bool,
 }
 
 /// A push that is decided on and not built yet.
@@ -350,6 +355,7 @@ impl Pipeline {
                     relay: Some(order.relay),
                     to: order.to,
                     count: 1,
+                    ring: mark == classify::CallMark::Ring,
                 });
                 pushed += 1;
                 continue;
@@ -441,6 +447,7 @@ impl Pipeline {
                     relay: Some(order.relay),
                     to: order.to,
                     count,
+                    ring: false,
                 });
                 true
             }
@@ -469,6 +476,7 @@ impl Pipeline {
                     relay: None,
                     to: order.to,
                     count,
+                    ring: false,
                 });
             }
         });
@@ -573,11 +581,12 @@ impl Pipeline {
             let Ok(_permit) = pipeline.sending.acquire().await else {
                 return;
             };
-            let Parcel { trace, kind, relay, to, count, message } = parcel;
+            let Parcel { trace, kind, relay, to, count, message, ring } = parcel;
             let target = Target {
                 token: to.token.clone(),
                 seal_to: to.seal_to.clone(),
                 sandbox: to.sandbox,
+                voip: false,
             };
             let provider = to
                 .provider
@@ -595,8 +604,62 @@ impl Pipeline {
                     return;
                 }
             };
-            let delivery =
-                retry::deliver(provider.as_ref(), &target, &message, pipeline.retry).await;
+            // A ring to an iPhone that gave a PushKit token goes to it as
+            // VoIP: iOS wakes the app for it at once, killed or not, and the
+            // app shows the call. When that does not work the ring goes as
+            // an alert to the device token, as to a phone without one: a
+            // dead VoIP token is forgotten (the device stays), a VoIP push
+            // APNs refuses or does not take in time leaves the token be.
+            let voip = match (ring, provider.kind(), &to.voip_token) {
+                (true, ProviderKind::Apns, Some(voip_token)) => Some(voip_token.clone()),
+                _ => None,
+            };
+            let mut delivery = None;
+            if let Some(voip_token) = voip {
+                let pushkit = Target {
+                    token: voip_token.clone(),
+                    voip: true,
+                    ..target.clone()
+                };
+                let tried =
+                    retry::deliver(provider.as_ref(), &pushkit, &message, pipeline.retry).await;
+                let last = tried.attempts.last();
+                match tried.outcome {
+                    Outcome::Delivered => delivery = Some((tried, pushkit)),
+                    Outcome::DeadToken => {
+                        tracing::info!(
+                            trace = %trace,
+                            device = %to.device_id,
+                            token = %pushkit.masked(),
+                            code = last.and_then(|a| a.code.as_deref()),
+                            "the VoIP token is dead: forgotten, the ring goes as an alert"
+                        );
+                        if let Err(e) = pipeline
+                            .store
+                            .drop_voip_token(&to.pubkey, &to.device_id, &voip_token)
+                            .await
+                        {
+                            tracing::error!(trace = %trace, error = %e, "the dead VoIP token not forgotten");
+                        }
+                    }
+                    other => tracing::warn!(
+                        trace = %trace,
+                        device = %to.device_id,
+                        token = %pushkit.masked(),
+                        outcome = ?other,
+                        http_status = last.and_then(|a| a.http_status),
+                        code = last.and_then(|a| a.code.as_deref()),
+                        "the VoIP push was not taken; the ring goes as an alert"
+                    ),
+                }
+            }
+            let (delivery, target) = match delivery {
+                Some(sent) => sent,
+                None => (
+                    retry::deliver(provider.as_ref(), &target, &message, pipeline.retry).await,
+                    target,
+                ),
+            };
             let outcome = match delivery.outcome {
                 Outcome::Delivered => "delivered",
                 Outcome::DeadToken => "dead_token",
@@ -611,6 +674,7 @@ impl Pipeline {
                 owner = %mask(&to.pubkey),
                 device = %to.device_id,
                 token = %target.masked(),
+                voip = target.voip,
                 count,
                 with_event = message.payload.event.is_some(),
                 bytes = message.payload.data_len(),

@@ -44,6 +44,10 @@ pub enum Request {
         /// A token of APNs from the sandbox: a development build of the app.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         sandbox: bool,
+        /// The token is the PushKit token of an iPhone: the push goes as
+        /// VoIP, to the topic `<bundle id>.voip`. APNs alone.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        voip: bool,
     },
     /// The devices of one owner, and what is watched for each.
     Devices { owner: String },
@@ -135,6 +139,9 @@ pub struct DeviceLine {
     pub last_outcome: Option<String>,
     /// When the push service vouched for the token. `None`: it has not yet.
     pub token_checked_at: Option<u64>,
+    /// The device gave a PushKit token too: its calls ring through VoIP.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub voip: bool,
     pub relays: Vec<String>,
     pub watched_groups: Vec<String>,
 }
@@ -187,6 +194,7 @@ impl From<Device> for DeviceLine {
             last_push_at: d.last_push_at,
             last_outcome: d.last_outcome,
             token_checked_at: d.token_checked_at,
+            voip: d.voip_token.is_some(),
         }
     }
 }
@@ -320,7 +328,8 @@ async fn handle(request: Request, state: &AdminState) -> Response {
             provider,
             token,
             sandbox,
-        } => test_push(state, &app, provider, token, sandbox).await,
+            voip,
+        } => test_push(state, &app, provider, token, sandbox, voip).await,
         Request::Devices { owner } => {
             // An owner is named as people name them: npub or hex.
             let pubkey = match nostr::key::PublicKey::parse(owner.trim()) {
@@ -374,7 +383,11 @@ async fn test_push(
     kind: ProviderKind,
     token: String,
     sandbox: bool,
+    voip: bool,
 ) -> Response {
+    if voip && kind != ProviderKind::Apns {
+        return Response::err("a VoIP push goes through apns alone: --provider apns");
+    }
     let provider = match state.providers.get(app, kind) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
@@ -382,6 +395,7 @@ async fn test_push(
     let trace = crate::api::next_request_id();
     let target = Target {
         sandbox,
+        voip,
         ..Target::of(token)
     };
 
@@ -390,6 +404,7 @@ async fn test_push(
     tracing::info!(
         app,
         provider = kind.as_str(),
+        voip,
         token = %target.masked(),
         trace = %trace,
         outcome = ?delivery.outcome,
@@ -514,6 +529,7 @@ mod tests {
             token_checked_at: None,
             seal_to: None,
             sandbox: false,
+            voip_token: None,
             relays: vec![],
             groups: vec![group("11", &["c1", "c0"]), group("22", &["c1"]), group("33", &[])],
         };
@@ -539,6 +555,21 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Request>(r#"{"cmd":"health"}"#).unwrap(),
             Request::Health
+        );
+        // A test push of before 0.8.0 reads as it did: not VoIP.
+        let push = |voip: bool| Request::TestPush {
+            app: "net.veydan.mobile".into(),
+            provider: ProviderKind::Apns,
+            token: "ab".into(),
+            sandbox: false,
+            voip,
+        };
+        let old = r#"{"cmd":"test_push","app":"net.veydan.mobile","provider":"apns","token":"ab"}"#;
+        assert_eq!(serde_json::to_string(&push(false)).unwrap(), old);
+        assert_eq!(serde_json::from_str::<Request>(old).unwrap(), push(false));
+        assert_eq!(
+            serde_json::to_string(&push(true)).unwrap(),
+            r#"{"cmd":"test_push","app":"net.veydan.mobile","provider":"apns","token":"ab","voip":true}"#
         );
     }
 }

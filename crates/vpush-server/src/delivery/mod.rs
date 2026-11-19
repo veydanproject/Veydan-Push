@@ -73,6 +73,10 @@ pub struct Target {
     /// The device takes its pushes from the sandbox of APNs: a build of the
     /// iOS app signed for development. False for every other device.
     pub sandbox: bool,
+    /// `token` is the PushKit token of an iPhone, and the push goes to it
+    /// as a VoIP push: only an invitation to a call, which the phone must
+    /// report to CallKit. False for every other push.
+    pub voip: bool,
 }
 
 impl Target {
@@ -82,6 +86,7 @@ impl Target {
             token: token.into(),
             seal_to: None,
             sandbox: false,
+            voip: false,
         }
     }
 

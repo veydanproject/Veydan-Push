@@ -96,6 +96,10 @@ enum Ctl {
         /// The token is of the sandbox of APNs: a development build of the iOS app.
         #[arg(long)]
         sandbox: bool,
+        /// The token is the PushKit (VoIP) token of an iPhone: the push goes
+        /// as VoIP, and the phone shows it as a call. APNs alone.
+        #[arg(long)]
+        voip: bool,
     },
 }
 
@@ -165,11 +169,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     provider,
                     token,
                     sandbox,
+                    voip,
                 } => Request::TestPush {
                     app,
                     provider: provider.parse().map_err(anyhow::Error::msg)?,
                     token,
                     sandbox,
+                    voip,
                 },
                 Ctl::Log(LogCmd::Set { spec, ttl }) => Request::LogSet {
                     spec,

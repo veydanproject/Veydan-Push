@@ -818,6 +818,7 @@ async fn a_private_server_seals_what_fcm_would_have_got_and_hands_it_to_the_gate
         token: ticket.clone(),
         seal_to: Some(device.public_key().to_hex()),
         sandbox: false,
+        voip: false,
     };
     let message = dm_message(200);
     let attempt = client.send(&target, &message).await;
@@ -905,6 +906,7 @@ async fn a_private_server_asks_for_an_urgent_wake_for_a_call_alone() {
         token: "7a".repeat(32),
         seal_to: Some(device.public_key().to_hex()),
         sandbox: false,
+        voip: false,
     };
     let mut call = dm_message(10);
     call.payload.call = true;
@@ -956,6 +958,7 @@ async fn a_push_that_does_not_fit_sealed_goes_by_its_id_and_a_lost_ticket_is_a_d
         token: "7a".repeat(32),
         seal_to: Some(device.public_key().to_hex()),
         sandbox: false,
+        voip: false,
     };
 
     // An event that fits FCM (3900) and not a sealed push (3600).
@@ -1022,6 +1025,7 @@ async fn a_gateway_that_says_wait_is_tried_again_by_the_policy_of_the_private_se
         token: "7a".repeat(32),
         seal_to: Some(device.public_key().to_hex()),
         sandbox: false,
+        voip: false,
     };
     let policy = RetryPolicy {
         max_attempts: 3,

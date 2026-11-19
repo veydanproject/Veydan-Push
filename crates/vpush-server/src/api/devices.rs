@@ -367,12 +367,19 @@ fn accepted(api: &Api, asked: &Asked, put: DevicePut) -> Result<Accepted, Refusa
         Channel::Fcm { token } => (token.clone(), None),
         // The token goes into the path of a request to APNs: hex, as APNs
         // gives it. The environment says which of its two hosts to push to.
-        Channel::Apns { token, environment } => {
+        // The VoIP token of PushKit goes into the same path, of the same
+        // host: kept beside the channel, it is hex too.
+        Channel::Apns { token, environment, voip_token } => {
             if !token.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(Refusal::bad("a token of APNs is hex characters"));
             }
             if !matches!(environment.as_str(), "production" | "sandbox") {
                 return Err(Refusal::bad("the environment of APNs is `production` or `sandbox`"));
+            }
+            if let Some(voip) = voip_token {
+                if voip.is_empty() || voip.len() > MAX_TOKEN || !voip.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(Refusal::bad("a VoIP token of APNs is hex characters"));
+                }
             }
             (
                 token.clone(),
@@ -585,6 +592,7 @@ pub async fn put(
                 token: input.token.clone(),
                 seal_to,
                 sandbox,
+                voip: false,
             };
             Some(check_token(provider.as_ref(), &target).await)
         };
@@ -773,6 +781,7 @@ pub async fn test(
             token: device.token.clone(),
             seal_to: device.seal_to.clone(),
             sandbox: device.sandbox,
+            voip: false,
         };
         let delivery = test_push(provider.as_ref(), &target, &rid).await;
         let outcome = outcome_name(delivery.outcome);

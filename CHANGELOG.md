@@ -3,6 +3,36 @@
 Versions of VPush are its own and do not follow the app. Tags are
 `v<version>`.
 
+## 0.8.0 — VoIP pushes for calls on iOS
+
+- The channel of APNs takes an optional `voip_token` beside `token`
+  (`spec/protocol.md`, "Through APNs"): the PushKit token of the iPhone,
+  hex, of the same environment. It is checked like the token (hex, not
+  empty, at most 4096 characters; else `bad_request`, and nothing is kept)
+  and kept with the channel; a registration without it forgets it. A
+  channel without it is what it was: every push goes to `token`.
+- The invitation to a call (`["call", "1"]` on the wrap, `call` in the
+  journal) to a device with a VoIP token goes to that token as a VoIP push:
+  `apns-push-type: voip`, `apns-topic` `<topic>.voip`, `apns-priority` 10,
+  `apns-expiration` the minute of a call, the body the keys of the push
+  (`type` `dm`, `call` `"1"`, the event or its id and relay) and no `aps`;
+  up to 5120 bytes, by its id above. Nothing else goes VoIP: the end of a
+  ringing (`["call", "0"]`, `call_end`), every message and every test push
+  of the API stay alerts or background pushes. iOS wants every VoIP push
+  reported to CallKit as an incoming call and stops waking an app that
+  does not, so only a ring may be one.
+- When the VoIP push fails the ring goes on as an alert to the device token,
+  as to a device without a VoIP token: a VoIP token APNs calls dead (`410`,
+  `400 BadDeviceToken`) is forgotten and the device stays, alive; a VoIP
+  push refused otherwise, or not taken in time, leaves the token be. The log
+  line `push` says `voip`.
+- `vpush ctl test-push --provider apns --voip --token <PushKit hex>
+  [--sandbox]` sends a VoIP test push (`type` `test`); `--voip` with another
+  provider is refused. `vpush ctl devices` shows `voip: true` for a device
+  with a VoIP token.
+- `golden/device_put_apns.json`: the registration of an iPhone with both
+  tokens.
+
 ## 0.7.0 — APNs: pushes to iPhones
 
 - APNs (`spec/protocol.md`, "Through APNs"): an app with

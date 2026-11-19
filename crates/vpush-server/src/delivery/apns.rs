@@ -7,6 +7,12 @@
 //! A push with nothing to show goes as a background push, which iOS shows
 //! nothing for.
 //!
+//! A target that is a PushKit token ([`Target::voip`]) is pushed to as VoIP:
+//! the topic of the app with `.voip`, priority 10, the keys of the push and
+//! no `aps`. iOS hands such a push to the app at once, and the app must
+//! report it to CallKit as an incoming call, or iOS stops waking it: so only
+//! the invitation to a call is sent so, and the pipeline decides that.
+//!
 //! There is no `apns-collapse-id`. On iOS a push with one takes the place
 //! of the notification on the screen, and every direct message is one chat
 //! to this server: each would wipe out the one before it. The chat goes
@@ -34,9 +40,14 @@ pub const PRODUCTION: &str = "https://api.push.apple.com";
 pub const SANDBOX: &str = "https://api.sandbox.push.apple.com";
 
 /// The most a push may weigh: APNs counts the whole body, every byte of the
-/// JSON, and refuses one above this. (A VoIP push may have 5120; none is
-/// sent.)
+/// JSON, and refuses one above this.
 pub const BODY_LIMIT: usize = 4096;
+
+/// The most a VoIP push may weigh.
+pub const VOIP_BODY_LIMIT: usize = 5120;
+
+/// What the topic of the app is followed by for a VoIP push.
+pub const VOIP_TOPIC_SUFFIX: &str = ".voip";
 
 /// What an alert push says by itself: a key of the app's own strings, shown
 /// when the extension of the app could not write the text.
@@ -154,11 +165,16 @@ pub enum PushKind {
     Alert,
     /// Wakes the app, shows nothing.
     Background,
+    /// To the PushKit token: hands the push to the app at once, which
+    /// reports it to CallKit as an incoming call. Only an invitation to a
+    /// call is sent so.
+    Voip,
 }
 
 impl PushKind {
-    /// What the push is: a background push when there is nothing to show
-    /// for it, an alert for everything else.
+    /// What a push to the device token is: a background push when there is
+    /// nothing to show for it, an alert for everything else. A push to the
+    /// PushKit token is [`PushKind::Voip`], whatever it carries.
     pub fn of(message: &Message, payload: &Payload) -> Self {
         if message.background || payload.is_silent() || payload.check {
             Self::Background
@@ -171,28 +187,45 @@ impl PushKind {
         match self {
             Self::Alert => "alert",
             Self::Background => "background",
+            Self::Voip => "voip",
         }
     }
 
     /// `apns-priority`: 10 sends now, 5 when convenient for the phone. A
-    /// background push must be 5: APNs refuses it at 10.
+    /// background push must be 5: APNs refuses it at 10. A VoIP push is a
+    /// ring, and always 10.
     pub fn priority(self, urgent: bool) -> u8 {
         match self {
             Self::Alert if urgent => 10,
+            Self::Voip => 10,
             _ => 5,
+        }
+    }
+
+    /// The most a push of this kind may weigh.
+    pub fn limit(self) -> usize {
+        match self {
+            Self::Voip => VOIP_BODY_LIMIT,
+            _ => BODY_LIMIT,
         }
     }
 }
 
-/// The body of a push: the keys of the push as FCM carries them, every
-/// value a string, and `aps` beside them.
+/// The body of a push to the device token: the keys of the push as FCM
+/// carries them, every value a string, and `aps` beside them.
 pub fn body(message: &Message, payload: &Payload) -> Value {
+    body_of(PushKind::of(message, payload), message, payload)
+}
+
+/// The body of a push of this kind. A VoIP push has the keys alone, and no
+/// `aps`: iOS shows nothing for it, the app shows the call.
+pub fn body_of(kind: PushKind, message: &Message, payload: &Payload) -> Value {
     let mut root: serde_json::Map<String, Value> = payload
         .to_data()
         .into_iter()
         .map(|(key, value)| (key, Value::String(value)))
         .collect();
-    let aps = match PushKind::of(message, payload) {
+    let aps = match kind {
         PushKind::Alert => {
             // The sound of the device: without the key iOS shows the
             // banner in silence, whatever the user allowed.
@@ -207,28 +240,41 @@ pub fn body(message: &Message, payload: &Payload) -> Value {
             aps
         }
         PushKind::Background => json!({ "content-available": 1 }),
+        PushKind::Voip => return Value::Object(root),
     };
     root.insert("aps".to_string(), aps);
     Value::Object(root)
 }
 
-/// The push as it is sent, within [`BODY_LIMIT`]: with the event when that
-/// fits, else in its other form, `event_id` and `relay` (`Message::fallback`).
-/// Measured here, before sending: APNs is not asked to refuse it first.
-pub fn encode(message: &Message) -> Result<(Vec<u8>, PushKind, bool), Attempt> {
-    let first = serde_json::to_vec(&body(message, &message.payload)).unwrap_or_default();
-    if first.len() <= BODY_LIMIT {
-        return Ok((first, PushKind::of(message, &message.payload), false));
+/// The push as it is sent, within the limit of its kind ([`BODY_LIMIT`],
+/// [`VOIP_BODY_LIMIT`]): with the event when that fits, else in its other
+/// form, `event_id` and `relay` (`Message::fallback`). Measured here, before
+/// sending: APNs is not asked to refuse it first. `voip`: the push goes to
+/// the PushKit token.
+pub fn encode(message: &Message, voip: bool) -> Result<(Vec<u8>, PushKind, bool), Attempt> {
+    let kind_of = |payload: &Payload| {
+        if voip {
+            PushKind::Voip
+        } else {
+            PushKind::of(message, payload)
+        }
+    };
+    let kind = kind_of(&message.payload);
+    let first = serde_json::to_vec(&body_of(kind, message, &message.payload)).unwrap_or_default();
+    if first.len() <= kind.limit() {
+        return Ok((first, kind, false));
     }
     if let Some(fallback) = &message.fallback {
-        let other = serde_json::to_vec(&body(message, fallback)).unwrap_or_default();
-        if other.len() <= BODY_LIMIT {
-            return Ok((other, PushKind::of(message, fallback), true));
+        let other_kind = kind_of(fallback);
+        let other =
+            serde_json::to_vec(&body_of(other_kind, message, fallback)).unwrap_or_default();
+        if other.len() <= other_kind.limit() {
+            return Ok((other, other_kind, true));
         }
     }
     Err(Attempt::new(Outcome::Rejected)
         .code("TOO_BIG")
-        .detail(format!("{} bytes, APNs takes {BODY_LIMIT}", first.len())))
+        .detail(format!("{} bytes, APNs takes {}", first.len(), kind.limit())))
 }
 
 /// `apns-expiration`: when APNs stops trying, in Unix seconds. 0 for a push
@@ -338,6 +384,16 @@ impl ApnsClient {
         }
     }
 
+    /// `apns-topic`: the bundle id of the app, and `<bundle id>.voip` for a
+    /// push to the PushKit token.
+    pub fn topic(&self, target: &Target) -> String {
+        if target.voip {
+            format!("{}{VOIP_TOPIC_SUFFIX}", self.topic)
+        } else {
+            self.topic.clone()
+        }
+    }
+
     fn make_token(&self) -> Result<Made, Attempt> {
         let iat = unix_now();
         let value = provider_token(&self.key, &self.key_id, &self.team_id, iat).map_err(|e| {
@@ -399,7 +455,7 @@ impl ApnsClient {
             .post(url)
             .header(reqwest::header::AUTHORIZATION, format!("bearer {token}"))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("apns-topic", &self.topic)
+            .header("apns-topic", self.topic(target))
             .header("apns-push-type", kind.as_str())
             .header("apns-priority", kind.priority(message.urgent).to_string())
             .header(
@@ -434,7 +490,7 @@ impl ApnsClient {
                 .code("NOT_A_TOKEN")
                 .detail("a token of APNs is hex characters");
         }
-        let (body, kind, by_id) = match encode(message) {
+        let (body, kind, by_id) = match encode(message, target.voip) {
             Ok(encoded) => encoded,
             Err(attempt) => return attempt,
         };
@@ -443,7 +499,8 @@ impl ApnsClient {
                 trace = message.payload.trace.as_deref().unwrap_or(""),
                 token = %target.masked(),
                 bytes = body.len(),
-                "the push with the event is over 4096 bytes for APNs; sent without it"
+                kind = kind.as_str(),
+                "the push with the event is over what APNs takes; sent without it"
             );
         }
         let token = match self.token().await {
@@ -678,7 +735,7 @@ mod tests {
     #[test]
     fn a_push_over_4096_goes_without_the_event_and_is_measured_as_sent() {
         // Fits: sent with the event.
-        let (bytes, _, by_id) = encode(&dm(100)).unwrap();
+        let (bytes, _, by_id) = encode(&dm(100), false).unwrap();
         assert!(!by_id);
         assert!(String::from_utf8(bytes).unwrap().contains("content"));
 
@@ -687,7 +744,7 @@ mod tests {
         let m = dm(2500);
         assert!(m.payload.fits(), "FCM would take it");
         assert!(serde_json::to_vec(&body(&m, &m.payload)).unwrap().len() > BODY_LIMIT);
-        let (bytes, kind, by_id) = encode(&m).unwrap();
+        let (bytes, kind, by_id) = encode(&m, false).unwrap();
         assert!(by_id);
         assert!(bytes.len() <= BODY_LIMIT);
         assert_eq!(kind, PushKind::Alert);
@@ -701,17 +758,74 @@ mod tests {
             .unwrap()
             .len();
         edge.payload.trace = Some("x".repeat(BODY_LIMIT - base - r#","trace":"""#.len()));
-        let (bytes, _, _) = encode(&edge).unwrap();
+        let (bytes, _, _) = encode(&edge, false).unwrap();
         assert_eq!(bytes.len(), BODY_LIMIT);
 
         // Nothing to fall back to: refused here, never sent.
         let mut big = message(Payload::new(PushType::Sealed));
         big.payload.blob = Some("a".repeat(BODY_LIMIT));
-        let a = encode(&big).err().unwrap();
+        let a = encode(&big, false).err().unwrap();
         assert_eq!(
             (a.outcome, a.code.as_deref()),
             (Outcome::Rejected, Some("TOO_BIG"))
         );
+    }
+
+    fn ring(event_len: usize) -> Message {
+        let mut m = dm(event_len);
+        m.payload.call = true;
+        if let Some(fallback) = m.fallback.as_mut() {
+            fallback.call = true;
+        }
+        m.ttl = Duration::from_secs(60);
+        m
+    }
+
+    #[test]
+    fn a_voip_push_carries_the_keys_of_the_alert_and_no_aps() {
+        let m = ring(10);
+        let (bytes, kind, by_id) = encode(&m, true).unwrap();
+        assert_eq!(kind, PushKind::Voip);
+        assert_eq!(kind.as_str(), "voip");
+        assert!(!by_id);
+        let voip: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(voip.get("aps").is_none(), "iOS shows nothing; the app shows the call");
+
+        // The same keys as the alert to the device token, `aps` aside: the
+        // phone opens the event the same way.
+        let (alert, alert_kind, _) = encode(&m, false).unwrap();
+        assert_eq!(alert_kind, PushKind::Alert);
+        let mut alert: Value = serde_json::from_slice(&alert).unwrap();
+        alert.as_object_mut().unwrap().remove("aps");
+        assert_eq!(voip, alert);
+        assert_eq!(voip["type"], "dm");
+        assert_eq!(voip["call"], "1");
+        assert!(voip["event"].is_string());
+
+        // Always now: a ring that waits is a missed call.
+        assert_eq!(PushKind::Voip.priority(true), 10);
+        assert_eq!(PushKind::Voip.priority(false), 10);
+    }
+
+    #[test]
+    fn a_voip_push_may_weigh_5120_and_goes_by_its_id_above() {
+        // Over the alert's 4096, within the 5120 of VoIP: with the event.
+        let m = ring(2500);
+        assert!(encode(&m, false).unwrap().2, "the alert goes by its id");
+        let (bytes, kind, by_id) = encode(&m, true).unwrap();
+        assert_eq!(kind, PushKind::Voip);
+        assert!(!by_id);
+        assert!(bytes.len() > BODY_LIMIT && bytes.len() <= VOIP_BODY_LIMIT);
+
+        // Over 5120: by its id, still VoIP.
+        let m = ring(4000);
+        let (bytes, kind, by_id) = encode(&m, true).unwrap();
+        assert_eq!(kind, PushKind::Voip);
+        assert!(by_id);
+        let sent: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(sent.get("event").is_none() && sent.get("aps").is_none());
+        assert_eq!(sent["relay"], "wss://node-1.veydan.net");
+        assert_eq!(sent["call"], "1");
     }
 
     #[test]

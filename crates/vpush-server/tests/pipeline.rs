@@ -208,6 +208,9 @@ struct Noted {
     events: Mutex<HashSet<String>>,
     /// Outcomes of pushes written down: the last step of every send.
     outcomes: AtomicUsize,
+    /// VoIP tokens forgotten as dead: each follows an attempt that is
+    /// not the last of its send (the ring goes on as an alert).
+    voip_dropped: AtomicUsize,
     /// Times the watcher read the plan and gave the relays their parts.
     plans: AtomicUsize,
 }
@@ -252,6 +255,11 @@ impl Store for Witness {
         let written = self.store.record_outcome(pubkey, device_id, token, outcome, now).await;
         self.noted.outcomes.fetch_add(1, Ordering::SeqCst);
         written
+    }
+    async fn drop_voip_token(&self, pubkey: &str, device_id: &str, voip_token: &str) -> vpush_server::store::Result<bool> {
+        let dropped = self.store.drop_voip_token(pubkey, device_id, voip_token).await;
+        self.noted.voip_dropped.fetch_add(1, Ordering::SeqCst);
+        dropped
     }
     async fn purge_expired(&self, now: u64) -> vpush_server::store::Result<u64> {
         self.store.purge_expired(now).await
@@ -656,7 +664,7 @@ impl Server {
             let now = (
                 self.flight.begun.load(Ordering::SeqCst),
                 self.flight.ended.load(Ordering::SeqCst),
-                self.noted.outcomes.load(Ordering::SeqCst),
+                self.noted.outcomes.load(Ordering::SeqCst) + self.noted.voip_dropped.load(Ordering::SeqCst),
             );
             let (begun, ended, written) = now;
             if begun == ended && ended == written && last.is_none_or(|last| last == now) {
@@ -664,7 +672,7 @@ impl Server {
             } else {
                 quiet = 0;
                 if Instant::now() > deadline {
-                    panic!("the sends never ended: begun {begun}, ended {ended}, outcomes written {written}");
+                    panic!("the sends never ended: begun {begun}, ended {ended}, outcomes and dropped VoIP tokens written {written}");
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1939,4 +1947,146 @@ async fn a_note_to_a_keeper_wakes_an_iphone_in_the_background() {
     assert!(body["aps"]["thread-id"].is_string(), "the chat, which groups its notifications");
     assert_eq!(carried(body)["id"], message.id.to_hex());
     assert!(server.pushes().await.is_empty(), "nothing went to FCM");
+}
+
+/// An iPhone of `owner` with its device token, and its PushKit token when
+/// it gave one.
+fn iphone(owner: &Keys, device: &str, relays: &[&Relay], token: &str, voip: Option<&str>) -> DeviceInput {
+    let mut iphone = phone(owner, device, relays);
+    iphone.app_id = IOS.to_string();
+    iphone.provider = "apns".to_string();
+    iphone.token = token.to_string();
+    let voip = voip.map(|v| format!(r#","voip_token":"{v}""#)).unwrap_or_default();
+    iphone.channel_json = Some(format!(
+        r#"{{"provider":"apns","token":"{token}","environment":"sandbox"{voip}}}"#
+    ));
+    iphone
+}
+
+/// A request APNs was handed, as far as these tests look at it.
+#[derive(Debug)]
+struct ToApple {
+    token: String,
+    topic: String,
+    kind: String,
+    priority: String,
+    expiration: u64,
+    body: Value,
+}
+
+async fn to_apple(server: &Server, count: usize) -> Vec<ToApple> {
+    apple_got(server, count).await;
+    server
+        .apple
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let header = |name: &str| r.headers[name].to_str().unwrap().to_string();
+            ToApple {
+                token: r.url.path().trim_start_matches("/3/device/").to_string(),
+                topic: header("apns-topic"),
+                kind: header("apns-push-type"),
+                priority: header("apns-priority"),
+                expiration: header("apns-expiration").parse().unwrap(),
+                body: serde_json::from_slice(&r.body).unwrap(),
+            }
+        })
+        .collect()
+}
+
+/// The invitation to a call goes to an iPhone that gave a PushKit token as
+/// a VoIP push: to that token, the topic `.voip`, at once, alive as long as
+/// the push of a call, the keys of the push and no `aps`. An iPhone without
+/// one is rung by an alert, as before. The end of a ringing is never VoIP:
+/// iOS wants every VoIP push shown as an incoming call.
+#[tokio::test]
+async fn a_ring_goes_as_voip_to_an_iphone_with_a_voip_token_and_nothing_else_does() {
+    let r = relay().await;
+    let server = server(&[&r], HOUR).await;
+    let alice = Keys::generate();
+    let (with, voip, without) = ("ab".repeat(32), "cd".repeat(32), "ef".repeat(32));
+    server.put(iphone(&alice, "iphone-1", &[&r], &with, Some(&voip))).await;
+    server.put(iphone(&alice, "iphone-2", &[&r], &without, None)).await;
+    server.watching(&alice, &[&r]).await;
+
+    let ring = wrap(&alice, &[&["call", "1"]]);
+    r.publish(&ring).await;
+    let got = to_apple(&server, 2).await;
+    let pushkit = got.iter().find(|p| p.token == voip).expect("a VoIP push to the PushKit token");
+    assert!(!got.iter().any(|p| p.token == with), "and nothing to the device token beside it");
+    assert_eq!(pushkit.topic, format!("{IOS}.voip"));
+    assert_eq!((pushkit.kind.as_str(), pushkit.priority.as_str()), ("voip", "10"));
+    let now = Timestamp::now().as_secs();
+    assert!(pushkit.expiration.abs_diff(now + 60) <= 5, "the minute of a call: {}", pushkit.expiration);
+    assert!(pushkit.body.get("aps").is_none(), "{:#}", pushkit.body);
+    assert_eq!(pushkit.body["type"], "dm");
+    assert_eq!(pushkit.body["call"], "1");
+    assert_eq!(carried(&pushkit.body)["id"], ring.id.to_hex());
+
+    let alert = got.iter().find(|p| p.token == without).expect("an alert to the iPhone without one");
+    assert_eq!(alert.topic, IOS);
+    assert_eq!((alert.kind.as_str(), alert.priority.as_str()), ("alert", "10"));
+    assert_eq!(alert.body["aps"]["alert"]["loc-key"], "push.new");
+    assert_eq!(alert.body["call"], "1");
+    assert_eq!(carried(&alert.body)["id"], ring.id.to_hex());
+    let mut voip_body = pushkit.body.clone();
+    voip_body.as_object_mut().unwrap().insert("aps".into(), alert.body["aps"].clone());
+    assert_eq!(voip_body, alert.body, "the same keys, `aps` aside");
+
+    // The end of the ringing: an alert to the device token of each.
+    let end = wrap(&alice, &[&["call", "0"]]);
+    r.publish(&end).await;
+    let got = to_apple(&server, 4).await;
+    let ends: Vec<&ToApple> = got[2..].iter().collect();
+    let mut tokens: Vec<&str> = ends.iter().map(|p| p.token.as_str()).collect();
+    tokens.sort();
+    assert_eq!(tokens, [with.as_str(), without.as_str()]);
+    for push in ends {
+        assert_eq!((push.topic.as_str(), push.kind.as_str()), (IOS, "alert"));
+        assert_eq!(carried(&push.body)["id"], end.id.to_hex());
+    }
+    let device = server.store.device(&alice.public_key().to_hex(), "iphone-1").await.unwrap().unwrap();
+    assert_eq!(device.voip_token, Some(voip));
+    assert_eq!(device.last_outcome.as_deref(), Some("delivered"));
+}
+
+/// A PushKit token APNs says is dead is forgotten, and the device is not:
+/// the ring goes on to its device token as an alert, and so does the next
+/// one, until the phone registers a VoIP token again.
+#[tokio::test]
+async fn a_dead_voip_token_is_forgotten_and_the_ring_goes_as_an_alert() {
+    let r = relay().await;
+    let server = server(&[&r], HOUR).await;
+    let (token, voip) = ("ab".repeat(32), "cd".repeat(32));
+    Mock::given(method("POST"))
+        .and(path(format!("/3/device/{voip}")))
+        .respond_with(ResponseTemplate::new(410).set_body_json(json!({ "reason": "Unregistered" })))
+        .with_priority(1)
+        .mount(&server.apple)
+        .await;
+    let alice = Keys::generate();
+    server.put(iphone(&alice, "iphone", &[&r], &token, Some(&voip))).await;
+    server.watching(&alice, &[&r]).await;
+
+    let ring = wrap(&alice, &[&["call", "1"]]);
+    r.publish(&ring).await;
+    let got = to_apple(&server, 2).await;
+    assert_eq!((got[0].token.as_str(), got[0].kind.as_str()), (voip.as_str(), "voip"));
+    assert_eq!((got[1].token.as_str(), got[1].kind.as_str()), (token.as_str(), "alert"));
+    assert_eq!(got[1].topic, IOS);
+    assert_eq!(got[1].body["call"], "1");
+    assert_eq!(carried(&got[1].body)["id"], ring.id.to_hex());
+
+    let device = server.store.device(&alice.public_key().to_hex(), "iphone").await.unwrap().unwrap();
+    assert_eq!(device.voip_token, None, "the VoIP token is forgotten");
+    assert_eq!((device.state.as_str(), device.token.as_str()), ("active", token.as_str()), "the device is not");
+    assert_eq!(device.last_outcome.as_deref(), Some("delivered"));
+
+    let again = wrap(&alice, &[&["call", "1"]]);
+    r.publish(&again).await;
+    let got = to_apple(&server, 3).await;
+    assert_eq!((got[2].token.as_str(), got[2].kind.as_str()), (token.as_str(), "alert"));
+    assert_eq!(carried(&got[2].body)["id"], again.id.to_hex());
 }

@@ -100,6 +100,12 @@ pub enum Channel {
         token: String,
         /// `production` or `sandbox`.
         environment: String,
+        /// The PushKit (VoIP) token of the device, hex, of the same
+        /// environment: an invitation to a call goes to it as a VoIP push
+        /// (`spec/protocol.md`, "Through APNs"). Absent: every push goes
+        /// to `token`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voip_token: Option<String>,
     },
     Unifiedpush {
         endpoint: String,

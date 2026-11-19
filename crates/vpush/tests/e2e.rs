@@ -615,6 +615,11 @@ fn test_push_for_an_unknown_app_names_the_known_ones() {
     let (ok, text) = server.ctl(&["test-push", "--app", "a", "--provider", "pigeon", "--token", "t"]);
     assert!(!ok);
     assert!(text.contains("`pigeon` is not a provider"), "{text}");
+
+    // A VoIP push is of APNs alone.
+    let (ok, text) = server.ctl(&["test-push", "--app", "a", "--provider", "fcm", "--voip", "--token", "t"]);
+    assert!(!ok);
+    assert!(text.contains("through apns alone"), "{text}");
 }
 
 #[test]

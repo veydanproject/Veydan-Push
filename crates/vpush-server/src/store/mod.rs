@@ -107,6 +107,9 @@ pub struct Device {
     pub seal_to: Option<String>,
     /// A device of APNs that takes its pushes from the sandbox.
     pub sandbox: bool,
+    /// The PushKit token of a device of APNs, when it gave one: the
+    /// invitations to a call go to it as VoIP pushes.
+    pub voip_token: Option<String>,
     pub relays: Vec<WatchedRelay>,
     pub groups: Vec<WatchedGroup>,
 }
@@ -162,6 +165,13 @@ pub trait Store: Send + Sync + 'static {
         outcome: &str,
         now: u64,
     ) -> Result<()>;
+
+    /// Forgets the PushKit token of a device, which APNs said is dead: the
+    /// device stays, and is rung by an alert to its device token until it
+    /// registers a VoIP token again. `voip_token` is the one the push went
+    /// to: a device that registered another since is left as it is. True
+    /// when one was forgotten.
+    async fn drop_voip_token(&self, pubkey: &str, device_id: &str, voip_token: &str) -> Result<bool>;
 
     /// Forgets the registrations nobody renewed. Returns how many.
     async fn purge_expired(&self, now: u64) -> Result<u64>;
@@ -296,6 +306,9 @@ pub struct Recipient {
     pub seal_to: Option<String>,
     /// A device of APNs that takes its pushes from the sandbox.
     pub sandbox: bool,
+    /// The PushKit token of a device of APNs, when it gave one: the
+    /// invitations to a call go to it as VoIP pushes.
+    pub voip_token: Option<String>,
 }
 
 /// What the server does on the relays.

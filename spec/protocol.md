@@ -124,7 +124,7 @@ longer watched.
 | Field | | Meaning |
 |---|---|---|
 | `app_id` | required | The Android package or the iOS bundle id |
-| `channel` | required | `{ "provider": "fcm", "token": "…" }`, or `{ "provider": "apns", "token": "<hex>", "environment": "production" }` (see [Through APNs](#through-apns)) |
+| `channel` | required | `{ "provider": "fcm", "token": "…" }`, or `{ "provider": "apns", "token": "<hex>", "environment": "production", "voip_token": "<hex>" }`, `voip_token` optional (see [Through APNs](#through-apns), [golden/device_put_apns.json](../golden/device_put_apns.json)) |
 | `app_version` | | For the operator's eyes |
 | `prefs` | | `{ "dm": true, "groups": true }`; both true when absent |
 | `author_key` | | 64 hex. With it the server does not push a user's own group message back to the user. See [the mark of the author](#vp-16-hex-the-mark-of-the-author) |
@@ -342,10 +342,13 @@ producing two notifications.
 ### Through APNs
 
 An iPhone registers with its device token, as hex characters, and the
-environment of APNs it was given the token by:
+environment of APNs it was given the token by; and, when it takes calls
+through PushKit, with its VoIP token beside it
+([golden/device_put_apns.json](../golden/device_put_apns.json)):
 
 ```json
-"channel": { "provider": "apns", "token": "<hex>", "environment": "production" }
+"channel": { "provider": "apns", "token": "<hex>", "environment": "production",
+             "voip_token": "<hex>" }
 ```
 
 `production` is a build of the App Store or of TestFlight, `sandbox` a build
@@ -353,6 +356,16 @@ signed for development. APNs keeps the two apart, and a token of one is no
 token at the other: every push to the device goes to the host of its
 environment (`api.push.apple.com`, `api.sandbox.push.apple.com`). A token
 that is not hex, or another environment, is refused with `bad_request`.
+
+`voip_token` is optional: the token PushKit gave the app
+(`PKPushRegistry`, the type `voIP`), of the same environment as `token`.
+It is checked as the token is: hex, not empty, at most 4096 characters, else
+`bad_request`, and nothing of the registration is kept. Only the
+invitation to a call goes to it ([VoIP pushes](#voip-pushes-the-invitation-to-a-call));
+every other push goes to `token`. A registration without it forgets the
+one before: an app that no longer takes calls through PushKit registers
+without it. A server older than 0.8.0 ignores the field, and rings the
+phone by an alert.
 
 The body of the push is the keys above, every value a string as through
 FCM, with `aps` beside them:
@@ -364,12 +377,13 @@ FCM, with `aps` beside them:
   "trace": "5f3a9c1e" }
 ```
 
-A push is one of two kinds, the header `apns-push-type`:
+A push is one of three kinds, the header `apns-push-type`:
 
 | `apns-push-type` | Pushes | `aps` |
 |---|---|---|
 | `alert` | `dm`, `group`, `sync`, `test`, `broadcast`, `sealed` | `"mutable-content": 1`, `"alert": { "loc-key": "push.new" }`, `"sound": "default"` (without it iOS shows the banner in silence), and `thread-id`, the chat |
 | `background` | `manifest_update`; a `test` that carries `check`; a `dm` about a note to the keeper of a channel (`["channel", "1"]` on the wrap), when it stands for that note alone | `"content-available": 1` and nothing else |
+| `voip` | the invitation to a call (`["call", "1"]` on the wrap), to the `voip_token` of a device that registered one; a `test` from `vpush ctl test-push --voip` | none: the keys alone |
 
 An alert is opened by the Notification Service Extension of the app, which
 writes the text from the event, as the app does on Android. `push.new` is a
@@ -381,10 +395,10 @@ counted beside it is a push about those messages, and an alert.
 
 | Header | Value |
 |---|---|
-| `apns-topic` | The bundle id of the app (`apps.<id>.apns.topic` of the server) |
-| `apns-push-type` | `alert` or `background`, above |
-| `apns-priority` | `10` for an urgent alert (a message, a group, `sync`, `test`, a call; `sealed` when its wake is urgent), `5` for the rest. A background push is always `5`: APNs refuses one at `10` |
-| `apns-expiration` | When APNs stops trying, Unix seconds: now and the time the push lives (a day; a minute for a call; ten minutes for a test). `0` for a push with no time to live: now or never |
+| `apns-topic` | The bundle id of the app (`apps.<id>.apns.topic` of the server); `<bundle id>.voip` for a VoIP push |
+| `apns-push-type` | `alert`, `background` or `voip`, above |
+| `apns-priority` | `10` for an urgent alert (a message, a group, `sync`, `test`, a call; `sealed` when its wake is urgent) and for every VoIP push, `5` for the rest. A background push is always `5`: APNs refuses one at `10` |
+| `apns-expiration` | When APNs stops trying, Unix seconds: now and the time the push lives (a day; a minute for a call, by alert or VoIP; ten minutes for a test). `0` for a push with no time to live: now or never |
 
 There is no `apns-collapse-id`. On iOS a push with one takes the place of
 the notification on the screen, and all direct messages are one chat to the
@@ -393,25 +407,72 @@ waiting push by goes into `thread-id` instead, which only groups the
 notifications of a chat. So through APNs the pushes about a chat are not
 replaced while the phone is off; each is delivered, and the app tidies up.
 
-APNs takes a body of 4096 bytes at most, and counts every byte of the
-JSON: `aps`, the keys and the escaping of the quotes in `event` with the
-rest. A push with the event that weighs more is sent in its other form,
-`event_id` and `relay`, at once: the server measures it before sending and
-does not wait for APNs to refuse it. So an event that fits through FCM may
-come by its id through APNs.
+APNs takes a body of 4096 bytes at most (5120 for a VoIP push), and counts
+every byte of the JSON: `aps`, the keys and the escaping of the quotes in
+`event` with the rest. A push with the event that weighs more is sent in
+its other form, `event_id` and `relay`, at once: the server measures it
+before sending and does not wait for APNs to refuse it. So an event that
+fits through FCM may come by its id through APNs.
 
 What APNs answers, as `vpush` tells it:
 
 | APNs | Outcome |
 |---|---|
 | `200` | `delivered` |
-| `410` (`Unregistered`), `400 BadDeviceToken` | `dead_token`: the device is not pushed to until it registers again |
+| `410` (`Unregistered`), `400 BadDeviceToken` | `dead_token`: the device is not pushed to until it registers again. Said of the `voip_token`, only the VoIP token is forgotten (below) |
 | `403 ExpiredProviderToken`, `403 InvalidProviderToken` | The server makes its token anew and sends the push once more; refused again, `rejected` |
 | `429`, `500`, `503` | `retry` |
 | any other, `400 DeviceTokenNotForTopic` among them | `rejected`: the device stays registered. A topic wrong in the config would say it of every device |
 
-A call is an alert like a message, marked `call`. VoIP pushes (PushKit) are
-not sent.
+#### VoIP pushes: the invitation to a call
+
+The invitation to a call to an iPhone that registered a `voip_token` goes
+to that token as a VoIP push, and not to `token`:
+
+```
+POST /3/device/<voip_token>
+apns-push-type: voip
+apns-topic: <bundle id>.voip
+apns-priority: 10
+apns-expiration: <now + 60>
+```
+
+```json
+{ "v": "2", "type": "dm", "call": "1",
+  "event": "{\"id\":\"…\",\"kind\":1059,…}", "trace": "5f3a9c1e" }
+```
+
+The body is the keys of the alert the device would have had, `aps` aside:
+the event when the push weighs at most 5120 bytes with it, else
+`event_id` and `relay`. iOS hands a VoIP push to the app at once, woken or
+started for it, and shows nothing itself: the app opens the event, as it
+does an alert, and shows the call.
+
+**Apple's rule: every VoIP push must be reported to CallKit as an incoming
+call** (`reportNewIncomingCall`), before the app's handler of the push
+returns. An app that does not is killed, and after a few times iOS stops
+handing it VoIP pushes at all. So the server sends nothing as VoIP but the
+invitation to a call: not the end of a ringing (`["call", "0"]`, which goes
+as an alert, as it always did), not a message, not a `test` of the API.
+For its part the app reports every VoIP push it is handed, even one that
+turns out to be no call it rings for (an invitation that expired, of
+somebody it has no chat with, not one at all): it reports the call, and
+ends it at once (`reportCall(with:endedAt:reason:)` `.failed`). A `test`
+push sent as VoIP from `vpush ctl test-push --voip` is reported and ended
+the same way.
+
+When the VoIP push does not go, the ring goes on to `token` as an alert,
+as to a device without a VoIP token, in the same send:
+
+- APNs says the VoIP token is dead (`410`, `400 BadDeviceToken`): the
+  server forgets the VoIP token, and the device stays, alive; its rings go
+  as alerts until it registers a VoIP token again;
+- APNs refuses the VoIP push otherwise, or does not take it after the
+  attempts of a push: the VoIP token is kept, and tried at the next ring.
+
+A device registered through the gateway of a private push server is rung
+by the wake of the gateway, an alert ([The wake](#the-wake)): the gateway
+cannot see that a wake is a ring.
 
 ### By type
 
@@ -516,7 +577,9 @@ when it fits, otherwise its id and relay. The phone opens it and finds the
 invitation; the mark tells it to open the event even when its settings
 show no content of messages, and the invitation of somebody it has no
 mutual chat with rings nothing. An app that knows no calls shows a
-message it cannot read.
+message it cannot read. To an iPhone that registered a `voip_token` the
+same push goes as a VoIP push, the one push that does
+([VoIP pushes](#voip-pushes-the-invitation-to-a-call)).
 
 A relay learns from the tag that the wrap is a call. It does not learn who
 calls whom beyond the recipient every wrap names, or whether the call is
