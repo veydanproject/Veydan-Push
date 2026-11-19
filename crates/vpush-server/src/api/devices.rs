@@ -336,6 +336,8 @@ struct Accepted {
     provider: Arc<dyn PushProvider>,
     /// The push key of a device registered through the gateway.
     seal_to: Option<String>,
+    /// A device of APNs that takes its pushes from the sandbox.
+    sandbox: bool,
 }
 
 fn accepted(api: &Api, asked: &Asked, put: DevicePut) -> Result<Accepted, Refusal> {
@@ -363,10 +365,20 @@ fn accepted(api: &Api, asked: &Asked, put: DevicePut) -> Result<Accepted, Refusa
 
     let (token, channel_json) = match &put.channel {
         Channel::Fcm { token } => (token.clone(), None),
-        Channel::Apns { token, .. } => (
-            token.clone(),
-            Some(serde_json::to_string(&put.channel).unwrap_or_default()),
-        ),
+        // The token goes into the path of a request to APNs: hex, as APNs
+        // gives it. The environment says which of its two hosts to push to.
+        Channel::Apns { token, environment } => {
+            if !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(Refusal::bad("a token of APNs is hex characters"));
+            }
+            if !matches!(environment.as_str(), "production" | "sandbox") {
+                return Err(Refusal::bad("the environment of APNs is `production` or `sandbox`"));
+            }
+            (
+                token.clone(),
+                Some(serde_json::to_string(&put.channel).unwrap_or_default()),
+            )
+        }
         Channel::Unifiedpush { endpoint, .. } => (
             endpoint.clone(),
             Some(serde_json::to_string(&put.channel).unwrap_or_default()),
@@ -390,6 +402,8 @@ fn accepted(api: &Api, asked: &Asked, put: DevicePut) -> Result<Accepted, Refusa
         Channel::Gateway { pubkey, .. } => Some(pubkey.clone()),
         _ => None,
     };
+    let sandbox =
+        matches!(&put.channel, Channel::Apns { environment, .. } if environment == "sandbox");
     if token.trim().is_empty() || token.len() > MAX_TOKEN {
         return Err(Refusal::bad("the token is empty or too long"));
     }
@@ -463,6 +477,7 @@ fn accepted(api: &Api, asked: &Asked, put: DevicePut) -> Result<Accepted, Refusa
         relays: answers,
         provider,
         seal_to,
+        sandbox,
     })
 }
 
@@ -529,6 +544,7 @@ pub async fn put(
             relays,
             provider,
             seal_to,
+            sandbox,
         } = accepted(&api, &asked, put)?;
         remembered(&api, &asked)?;
 
@@ -568,6 +584,7 @@ pub async fn put(
             let target = Target {
                 token: input.token.clone(),
                 seal_to,
+                sandbox,
             };
             Some(check_token(provider.as_ref(), &target).await)
         };
@@ -755,6 +772,7 @@ pub async fn test(
         let target = Target {
             token: device.token.clone(),
             seal_to: device.seal_to.clone(),
+            sandbox: device.sandbox,
         };
         let delivery = test_push(provider.as_ref(), &target, &rid).await;
         let outcome = outcome_name(delivery.outcome);

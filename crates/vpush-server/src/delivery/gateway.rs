@@ -114,6 +114,12 @@ impl SealKey {
 pub fn open(push_key: &SecretKey, sender: &PublicKey, blob: &str) -> Result<String, String> {
     let bytes = URL_SAFE_NO_PAD.decode(blob).map_err(|e| e.to_string())?;
     let key = ConversationKey::derive(push_key, sender).map_err(|e| e.to_string())?;
+    // NIP-44 wants the version refused before anything is decrypted, and
+    // the v2 decryptor of nostr takes the first byte for granted (the MAC
+    // does not cover it): read here, as the device does.
+    if bytes.first() != Some(&nip44::Version::V2.as_u8()) {
+        return Err("the blob is not NIP-44 v2".to_string());
+    }
     let plain = nip44::v2::decrypt_to_bytes(&key, &bytes).map_err(|e| e.to_string())?;
     String::from_utf8(plain).map_err(|e| e.to_string())
 }
@@ -280,6 +286,7 @@ impl PushProvider for GatewayClient {
                 collapse_key: None,
                 ttl: super::TEST_TTL,
                 urgent: true,
+                background: false,
             };
             let attempt = self.send(target, &message).await;
             match attempt.outcome {
@@ -349,6 +356,7 @@ mod tests {
                 collapse_key: None,
                 ttl: Duration::from_secs(60),
                 urgent: true,
+                background: false,
             }
         };
         assert!(urgent(&message(PushType::Dm, true)));
@@ -383,6 +391,17 @@ mod tests {
         assert_eq!(inside, r#"{"trace":"abcd1234","type":"test","v":"2"}"#);
         // Another key opens nothing.
         assert!(open(Keys::generate().secret_key(), &sender, &blob).is_err());
+        // Another version byte is refused before the decryption.
+        let bytes = URL_SAFE_NO_PAD.decode(&blob).unwrap();
+        for version in [0u8, 1, 3, 255] {
+            let mut other = bytes.clone();
+            other[0] = version;
+            assert_eq!(
+                open(device.secret_key(), &sender, &URL_SAFE_NO_PAD.encode(other)).unwrap_err(),
+                "the blob is not NIP-44 v2",
+                "version {version}"
+            );
+        }
     }
 
     #[test]

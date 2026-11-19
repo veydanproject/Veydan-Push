@@ -3,6 +3,47 @@
 Versions of VPush are its own and do not follow the app. Tags are
 `v<version>`.
 
+## 0.7.0 — APNs: pushes to iPhones
+
+- APNs (`spec/protocol.md`, "Through APNs"): an app with
+  `[apps."<id>".apns]` (`key_file`, the `.p8` of the developer account,
+  read at the start and refused unless it is an ES256 P-256 key in PKCS#8
+  PEM; `key_id`, `team_id`, `topic`) takes devices with the channel
+  `{ "provider": "apns", "token": "<hex>", "environment": "production" |
+  "sandbox" }`, and pushes to each at the host of its environment
+  (`api.push.apple.com`, `api.sandbox.push.apple.com`) over HTTP/2, with a
+  provider token (JWT ES256: `kid`, `iss`, `iat`) made anew every 50
+  minutes. A token that is not hex, or another environment, is refused
+  with `bad_request`. No question is asked about a token at registration:
+  APNs has none that sends nothing.
+- The body is the keys FCM carries in `data`, every value a string, with
+  `aps` beside them. An alert (`dm`, `group`, `sync`, `test`, `broadcast`,
+  `sealed`) carries `mutable-content`, `alert.loc-key` `push.new` (the
+  app's own text when its extension cannot write one), `sound` `default`
+  (without the key iOS shows the banner in silence) and `thread-id`, the
+  key FCM replaces a waiting push by; a background push (`manifest_update`,
+  a `test` with `check`, a direct message that is a note to the keeper of
+  a channel, `["channel", "1"]` on the wrap, by itself) carries
+  `content-available` alone, at priority 5. No `apns-collapse-id`: on iOS
+  it would replace the notification on the screen, one direct message by
+  the next. `apns-priority` 10 for an urgent alert, else 5;
+  `apns-expiration` now and the time the push lives.
+- A body over 4096 bytes is measured before it is sent, and a push with
+  the event goes in its other form, `event_id` and `relay`, at once;
+  without one it is `rejected` with `TOO_BIG` and not sent.
+- What APNs answers: `410` and `400 BadDeviceToken` are a dead token;
+  `403 ExpiredProviderToken` or `InvalidProviderToken` makes the provider
+  token anew (once in 20 minutes at most) and sends the push once more;
+  `429` and `5xx` are tried again, with `Retry-After` when it is given;
+  everything else is `rejected` and kills no token, `DeviceTokenNotForTopic`
+  among them.
+- `Message.background` (a wake with nothing to show) and `Target.sandbox`
+  (from the stored channel) in the server's delivery; `vpush ctl test-push
+  --provider apns --token <hex> [--sandbox]`.
+- The server kit (`services/server`): `APNS_APPS`, `APNS_KEY_ID`,
+  `APNS_TEAM_ID` in `server.conf` and `apns-<app id>.p8` beside the
+  installer write `[apps."<id>".apns]`, as `FCM_APPS` writes the section of
+  FCM.
 ## 0.6.0 — VGuard in a repository of its own
 
 - VGuard, the read policy of a relay, leaves this repository: since 0.6.0

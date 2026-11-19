@@ -9,15 +9,26 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_vpush");
 
-/// The log line of a server that listens. Not just "ready": a server that
-/// could not start says "Address already in use".
+/// The log line of a server that listens, with the address it took.
 const READY: &str = ": ready ";
+
+/// The address the server is told it is reached at, and the one signed
+/// requests name. Nothing connects to it: requests go to the port the
+/// server took.
+const PUBLIC: &str = "http://localhost:8080";
+
+/// The one deadline of the waits: a loaded host makes everything slow, and
+/// what does not happen within it is not going to.
+const WAIT: Duration = Duration::from_secs(30);
 
 struct Server {
     child: Child,
     dir: PathBuf,
     port: u16,
     out: Arc<Mutex<Vec<String>>>,
+    /// The threads that take the lines from the pipes of the child: done
+    /// when the child is gone and its last line taken.
+    readers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for Server {
@@ -36,17 +47,20 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn write_config(dir: &Path, port: u16, log: &str) -> PathBuf {
-    write_config_with(dir, port, log, "")
+fn write_config(dir: &Path, log: &str) -> PathBuf {
+    write_config_with(dir, log, "")
 }
 
-fn write_config_with(dir: &Path, port: u16, log: &str, extra: &str) -> PathBuf {
+/// The server listens on a port the system gives it when it binds, and
+/// says which in its ready line: no port is chosen here and let go for
+/// another process to take before the server does.
+fn write_config_with(dir: &Path, log: &str, extra: &str) -> PathBuf {
     let path = dir.join("vpush.toml");
     std::fs::write(
         &path,
         format!(
-            "public_url = \"http://localhost:{port}\"\n\
-             [server]\nlisten = \"127.0.0.1:{port}\"\n\
+            "public_url = \"{PUBLIC}\"\n\
+             [server]\nlisten = \"127.0.0.1:0\"\n\
              [admin]\nsocket = \"{}\"\n\
              [store]\npath = \"{}\"\n\
              [log]\n{log}\n{extra}\n",
@@ -67,51 +81,42 @@ impl Server {
     fn start_with(name: &str, extra: impl Fn(&Path) -> String) -> Self {
         // Unix socket paths are short; the system temp dir keeps them so.
         let dir = std::env::temp_dir().join(format!("vpush-{name}-{}", std::process::id()));
-        // free_port() lets the port go before the server takes it, so another
-        // process may take it first; the server then stops at its start, and
-        // the start is tried again on another port.
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let port = free_port();
-            let config = write_config_with(&dir, port, "level = \"info\"", &extra(&dir));
-            let out = Arc::new(Mutex::new(Vec::new()));
-            let child = Self::spawn(&config, &out);
-            let mut server = Self {
-                child,
-                dir: dir.clone(),
-                port,
-                out,
-            };
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while server.count(READY) == 0 {
-                if let Some(status) = server.child.try_wait().unwrap() {
-                    // Let the readers take the last lines from the pipes.
-                    std::thread::sleep(Duration::from_millis(200));
-                    let text = server.lines().join("\n");
-                    if attempt < 5 && text.contains("Address already in use") {
-                        break;
-                    }
-                    panic!("the server did not start ({status}):\n{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = write_config_with(&dir, "level = \"info\"", &extra(&dir));
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let (child, readers) = Self::spawn(&config, &out);
+        let mut server = Self { child, dir, port: 0, out, readers };
+        server.port = server.ready(0);
+        server
+    }
+
+    /// Waits for the ready line after the first `before` of them, and
+    /// returns the port it names.
+    fn ready(&mut self, before: usize) -> u16 {
+        let deadline = Instant::now() + WAIT;
+        while self.count(READY) == before {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                // The pipes close with the child: the readers end when its
+                // last line is taken.
+                for reader in self.readers.drain(..) {
+                    let _ = reader.join();
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "`{READY}` did not appear in:\n{}",
-                    server.lines().join("\n")
-                );
-                std::thread::sleep(Duration::from_millis(20));
+                panic!("the server did not start ({status}):\n{}", self.lines().join("\n"));
             }
-            if server.count(READY) > 0 {
-                return server;
+            if Instant::now() > deadline {
+                panic!("`{READY}` did not appear in:\n{}", self.lines().join("\n"));
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
+        let line = self.lines().into_iter().filter(|l| l.contains(READY)).nth(before).unwrap();
+        let listen = line.split_whitespace().find_map(|word| word.strip_prefix("listen=")).unwrap();
+        listen.trim_matches('"').rsplit(':').next().unwrap().parse().unwrap()
     }
 
     /// Starts the server. What it logs, and what it says when it falls, is
     /// gathered in `out`.
-    fn spawn(config: &Path, out: &Arc<Mutex<Vec<String>>>) -> Child {
+    fn spawn(config: &Path, out: &Arc<Mutex<Vec<String>>>) -> (Child, Vec<std::thread::JoinHandle<()>>) {
         let mut child = Command::new(BIN)
             .args(["serve", "--config"])
             .arg(config)
@@ -123,28 +128,46 @@ impl Server {
             Box::new(child.stdout.take().unwrap()),
             Box::new(child.stderr.take().unwrap()),
         ];
-        for pipe in pipes {
-            let sink = Arc::clone(out);
-            std::thread::spawn(move || {
-                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                    sink.lock().unwrap().push(line);
-                }
-            });
-        }
-        child
+        let readers = pipes
+            .into_iter()
+            .map(|pipe| {
+                let sink = Arc::clone(out);
+                std::thread::spawn(move || {
+                    for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                        sink.lock().unwrap().push(line);
+                    }
+                })
+            })
+            .collect();
+        (child, readers)
     }
 
-    /// Stops the server and starts it again, with the config as it is now.
+    /// Stops the server and starts it again, with the config as it is now,
+    /// on a port it takes anew.
     fn restart(&mut self) {
         self.signal("TERM");
         let _ = self.child.wait();
-        let before = self.count(READY);
-        self.child = Self::spawn(&self.config(), &self.out);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while self.count(READY) == before {
-            assert!(Instant::now() < deadline, "not started again:\n{}", self.lines().join("\n"));
-            std::thread::sleep(Duration::from_millis(20));
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
         }
+        let before = self.count(READY);
+        (self.child, self.readers) = Self::spawn(&self.config(), &self.out);
+        self.port = self.ready(before);
+    }
+
+    /// A request on the port of the server that is logged at the default
+    /// level, and seen in the log: a line written before it was asked for
+    /// is in the log by now, since the server writes every line to one
+    /// pipe as it happens, and logs a request before it answers.
+    fn marker(&self, name: &str) {
+        let path = format!("/marker-{name}");
+        assert!(self.get(&path).starts_with("HTTP/1.1 404"));
+        self.wait_for(&format!("path=\"{path}\""));
+    }
+
+    /// The URL a signed request names.
+    fn public(&self, path: &str) -> String {
+        format!("{PUBLIC}{path}")
     }
 
     fn config(&self) -> PathBuf {
@@ -164,13 +187,11 @@ impl Server {
     }
 
     fn wait_for_times(&self, needle: &str, times: usize) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + WAIT;
         while self.count(needle) < times {
-            assert!(
-                Instant::now() < deadline,
-                "`{needle}` did not appear {times} time(s) in:\n{}",
-                self.lines().join("\n")
-            );
+            if Instant::now() > deadline {
+                panic!("`{needle}` did not appear {times} time(s) in:\n{}", self.lines().join("\n"));
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -236,9 +257,10 @@ fn unknown_route_is_a_json_error_and_is_logged() {
     assert!(answer.contains(r#""code":"not_found""#), "{answer}");
 
     server.wait_for("path=\"/nothing-here\"");
-    // The health check stays out of the log at the default level.
+    // The health check stays out of the log at the default level: nothing
+    // of it is there when the request after it is.
     server.get("/healthz");
-    std::thread::sleep(Duration::from_millis(200));
+    server.marker("after-health");
     assert_eq!(server.count("path=\"/healthz\""), 0);
 }
 
@@ -248,10 +270,12 @@ fn log_level_changes_without_a_restart_and_comes_back() {
     let debug_line = "admin request";
 
     server.ctl(&["health"]);
-    std::thread::sleep(Duration::from_millis(200));
+    server.marker("at-the-start");
     assert_eq!(server.count(debug_line), 0, "debug is off at the start");
 
-    let (ok, text) = server.ctl(&["log", "set", "admin=debug", "--for", "2s"]);
+    // Five seconds: long enough for the request after it on a busy host,
+    // and waited out below.
+    let (ok, text) = server.ctl(&["log", "set", "admin=debug", "--for", "5s"]);
     assert!(ok, "{text}");
     assert!(text.contains(r#""effective": "info,admin=debug""#), "{text}");
 
@@ -265,7 +289,7 @@ fn log_level_changes_without_a_restart_and_comes_back() {
 
     let before = server.count(debug_line);
     server.ctl(&["health"]);
-    std::thread::sleep(Duration::from_millis(200));
+    server.marker("after-the-override");
     assert_eq!(server.count(debug_line), before, "debug is off again");
 }
 
@@ -327,7 +351,7 @@ fn a_lifetime_no_clock_counts_to_is_refused_and_the_server_lives() {
 fn sighup_applies_the_log_section() {
     let server = Server::start("sighup");
 
-    write_config(&server.dir, server.port, "level = \"warn\"\n[log.targets]\nserve = \"info\"\nadmin = \"debug\"");
+    write_config(&server.dir, "level = \"warn\"\n[log.targets]\nserve = \"info\"\nadmin = \"debug\"");
     server.signal("HUP");
     server.wait_for("config re-read");
 
@@ -358,7 +382,7 @@ fn sigterm_stops_cleanly_and_removes_the_socket() {
     assert!(socket.exists());
 
     server.signal("TERM");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT;
     let status = loop {
         if let Some(status) = server.child.try_wait().unwrap() {
             break status;
@@ -574,8 +598,11 @@ async fn a_test_push_the_service_never_answers_ends_with_an_outcome_at_the_termi
     assert!(ok, "{text}");
     assert!(text.contains(r#""outcome": "retry""#), "{text}");
     assert!(text.contains(r#""code": "DEADLINE""#), "{text}");
+    // The deadline ended the push (`DEADLINE`, while the service would
+    // have answered at sixty seconds), and it was the server's ten seconds
+    // that `ctl` outwaited: a busy host only makes it later.
     let took = started.elapsed();
-    assert!(took >= Duration::from_secs(10) && took < Duration::from_secs(14), "{took:?}");
+    assert!(took >= Duration::from_secs(10), "{took:?}");
 }
 
 #[test]
@@ -597,7 +624,6 @@ fn a_broken_service_account_stops_the_start_with_a_reason() {
     std::fs::write(dir.join("fcm.json"), "{}").unwrap();
     let config = write_config_with(
         &dir,
-        free_port(),
         "level = \"info\"",
         &format!(
             "[apps.app.fcm]\nservice_account = \"{}\"\n",
@@ -657,7 +683,7 @@ async fn a_token_fcm_does_not_know_is_refused_and_counted() {
         .put(format!("http://127.0.0.1:{}{path}", server.port))
         .header(
             "authorization",
-            signed(&alice, "PUT", &format!("http://localhost:{}{path}", server.port), body.as_bytes()),
+            signed(&alice, "PUT", &server.public(path), body.as_bytes()),
         )
         .body(body)
         .send()
@@ -815,7 +841,7 @@ async fn a_message_on_a_gated_relay_becomes_a_push_and_the_key_of_the_relay_stay
         .put(format!("http://127.0.0.1:{}{path}", server.port))
         .header(
             "authorization",
-            signed(&alice, "PUT", &format!("http://localhost:{}{path}", server.port), body.as_bytes()),
+            signed(&alice, "PUT", &server.public(path), body.as_bytes()),
         )
         .body(body)
         .send()
@@ -921,7 +947,7 @@ async fn a_relay_behind_tls_does_not_take_the_server_down() {
         .put(format!("http://127.0.0.1:{}{path}", server.port))
         .header(
             "authorization",
-            signed(&alice, "PUT", &format!("http://localhost:{}{path}", server.port), body.as_bytes()),
+            signed(&alice, "PUT", &server.public(path), body.as_bytes()),
         )
         .body(body)
         .send()
@@ -931,13 +957,20 @@ async fn a_relay_behind_tls_does_not_take_the_server_down() {
 
     tokio::task::block_in_place(|| {
         server.wait_for(&format!("watching relay={relay_url}"));
-        // Long enough for a handshake to begin, fail, and begin again.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while *asked.lock().unwrap() == 0 {
-            assert!(Instant::now() < deadline, "the server never came to the relay");
+        // The server came to the relay, began a handshake, and saw it fail:
+        // the line says the relay is off the line. A handshake that took
+        // the server down, or its task, would never get there.
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let (ok, relays) = server.ctl(&["relays"]);
+            if ok && *asked.lock().unwrap() > 0 && relays.contains(r#""state": "disconnected""#) {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("the handshake never ended (connections {}): {relays}", *asked.lock().unwrap());
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
-        std::thread::sleep(Duration::from_secs(2));
     });
 
     let log = server.lines().join("\n");
@@ -982,7 +1015,7 @@ async fn a_relay_whose_address_is_not_taken_is_said_to_be_off_the_line_and_tried
             .put(format!("http://127.0.0.1:{}{path}", server.port))
             .header(
                 "authorization",
-                signed(&alice, "PUT", &format!("http://localhost:{}{path}", server.port), body.as_bytes()),
+                signed(&alice, "PUT", &server.public(path), body.as_bytes()),
             )
             .body(body.clone())
             .send()

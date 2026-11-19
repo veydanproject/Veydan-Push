@@ -143,6 +143,7 @@ impl SqliteStore {
         let secs = |name: &str| -> Result<u64> {
             Ok(row.try_get::<i64, _>(name).map_err(db)?.max(0) as u64)
         };
+        let channel: Option<String> = row.try_get("channel_json").map_err(db)?;
         Ok(Device {
             pubkey: row.try_get("pubkey").map_err(db)?,
             device_id: row.try_get("device_id").map_err(db)?,
@@ -168,7 +169,8 @@ impl SqliteStore {
                 .try_get::<Option<i64>, _>("token_checked_at")
                 .map_err(db)?
                 .map(|v| v.max(0) as u64),
-            seal_to: seal_to(row.try_get("channel_json").map_err(db)?),
+            seal_to: seal_to(channel.as_deref()),
+            sandbox: sandbox(channel.as_deref()),
             relays,
             groups,
         })
@@ -961,6 +963,7 @@ mod tests {
 
 
 fn recipient(row: &SqliteRow) -> Result<super::Recipient> {
+    let channel: Option<String> = row.try_get("channel_json").map_err(db)?;
     Ok(super::Recipient {
         pubkey: row.try_get("pubkey").map_err(db)?,
         device_id: row.try_get("device_id").map_err(db)?,
@@ -968,17 +971,30 @@ fn recipient(row: &SqliteRow) -> Result<super::Recipient> {
         provider: row.try_get("provider").map_err(db)?,
         token: row.try_get("token").map_err(db)?,
         author_key: row.try_get("author_key").map_err(db)?,
-        seal_to: seal_to(row.try_get("channel_json").map_err(db)?),
+        seal_to: seal_to(channel.as_deref()),
+        sandbox: sandbox(channel.as_deref()),
     })
 }
 
 /// The push key of a device registered through the gateway, from what its
 /// channel said.
-fn seal_to(channel_json: Option<String>) -> Option<String> {
-    match serde_json::from_str::<vpush_proto::Channel>(channel_json.as_deref()?) {
+fn seal_to(channel_json: Option<&str>) -> Option<String> {
+    match serde_json::from_str::<vpush_proto::Channel>(channel_json?) {
         Ok(vpush_proto::Channel::Gateway { pubkey, .. }) => Some(pubkey),
         _ => None,
     }
+}
+
+/// Whether a device of APNs takes its pushes from the sandbox, from what
+/// its channel said. Anything but `sandbox` is production.
+fn sandbox(channel_json: Option<&str>) -> bool {
+    let Some(json) = channel_json else {
+        return false;
+    };
+    matches!(
+        serde_json::from_str::<vpush_proto::Channel>(json),
+        Ok(vpush_proto::Channel::Apns { environment, .. }) if environment == "sandbox"
+    )
 }
 
 #[async_trait]
@@ -1698,5 +1714,26 @@ mod ticket_tests {
         // A device of FCM has none.
         s.put_device(input(BOB, "phone-1", "t1"), ROOMY).await.unwrap();
         assert_eq!(s.dm_recipients(BOB, 1500).await.unwrap()[0].seal_to, None);
+    }
+
+    #[tokio::test]
+    async fn a_device_of_apns_says_its_environment_and_is_told_with_it() {
+        let s = SqliteStore::in_memory().await.unwrap();
+        for (owner, environment, sandbox) in [(ALICE, "sandbox", true), (BOB, "production", false)] {
+            let mut phone = input(owner, "phone-1", &"0a".repeat(32));
+            phone.provider = "apns".into();
+            phone.channel_json = Some(format!(
+                r#"{{"provider":"apns","token":"{}","environment":"{environment}"}}"#,
+                "0a".repeat(32)
+            ));
+            s.put_device(phone, ROOMY).await.unwrap();
+            let d = s.device(owner, "phone-1").await.unwrap().unwrap();
+            assert_eq!(d.sandbox, sandbox, "{environment}");
+            assert_eq!(d.seal_to, None);
+            assert_eq!(s.dm_recipients(owner, 1500).await.unwrap()[0].sandbox, sandbox);
+        }
+        // A device of FCM is in no sandbox.
+        s.put_device(input("cc", "phone-1", "t1"), ROOMY).await.unwrap();
+        assert!(!s.dm_recipients("cc", 1500).await.unwrap()[0].sandbox);
     }
 }

@@ -544,6 +544,7 @@ mod tests {
             collapse_key: Some("k".into()),
             ttl: Duration::from_secs(60),
             urgent: true,
+            background: false,
         };
         let body = FcmClient::body(&Target::of("t"), &message, &payload);
         let message = &body["message"];

@@ -87,12 +87,15 @@ enum Ctl {
         /// App id, as in the config.
         #[arg(long)]
         app: String,
-        /// fcm, apns, unifiedpush.
+        /// fcm, apns.
         #[arg(long, default_value = "fcm")]
         provider: String,
         /// Token of the device.
         #[arg(long)]
         token: String,
+        /// The token is of the sandbox of APNs: a development build of the iOS app.
+        #[arg(long)]
+        sandbox: bool,
     },
 }
 
@@ -161,10 +164,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     app,
                     provider,
                     token,
+                    sandbox,
                 } => Request::TestPush {
                     app,
                     provider: provider.parse().map_err(anyhow::Error::msg)?,
                     token,
+                    sandbox,
                 },
                 Ctl::Log(LogCmd::Set { spec, ttl }) => Request::LogSet {
                     spec,

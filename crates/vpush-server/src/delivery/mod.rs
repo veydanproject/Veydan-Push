@@ -5,6 +5,7 @@
 //! is dead (the device is forgotten) and everything else (it is not): a
 //! mistake of ours must never cost a user their registration.
 
+pub mod apns;
 pub mod fcm;
 pub mod gateway;
 pub mod http;
@@ -69,6 +70,9 @@ pub struct Target {
     /// it is sealed to: a device registered through the gateway has one,
     /// every other none.
     pub seal_to: Option<String>,
+    /// The device takes its pushes from the sandbox of APNs: a build of the
+    /// iOS app signed for development. False for every other device.
+    pub sandbox: bool,
 }
 
 impl Target {
@@ -77,6 +81,7 @@ impl Target {
         Self {
             token: token.into(),
             seal_to: None,
+            sandbox: false,
         }
     }
 
@@ -123,6 +128,11 @@ pub struct Message {
     pub ttl: Duration,
     /// Wake the device now, or deliver when convenient.
     pub urgent: bool,
+    /// The push wakes the app to do its work, and there is nothing to show
+    /// for it: a note to the keeper of a channel. APNs is told so (a
+    /// background push, which iOS shows nothing for); an FCM push is data
+    /// only whatever this says.
+    pub background: bool,
 }
 
 /// What happened to one attempt.
@@ -262,6 +272,7 @@ pub async fn test_push(provider: &dyn PushProvider, target: &Target, trace: &str
         collapse_key: None,
         ttl: TEST_TTL,
         urgent: true,
+        background: false,
     };
     let once = RetryPolicy {
         max_attempts: 1,
@@ -298,6 +309,11 @@ impl Providers {
             if let Some(fcm) = &app.fcm {
                 let client = fcm::FcmClient::from_config(fcm)
                     .map_err(|e| anyhow::anyhow!("apps.{app_id}.fcm: {e}"))?;
+                out.insert(app_id, Arc::new(client));
+            }
+            if let Some(apns) = &app.apns {
+                let client = apns::ApnsClient::from_config(apns)
+                    .map_err(|e| anyhow::anyhow!("apps.{app_id}.apns: {e}"))?;
                 out.insert(app_id, Arc::new(client));
             }
         }

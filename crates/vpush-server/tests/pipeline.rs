@@ -1,17 +1,26 @@
 //! From an event on a relay to a push at the push service: the watcher and
 //! the pipeline against real relays (in this process) and a push service
 //! played by a mock.
+//!
+//! A test that counts pushes proves that no more came by a fence, not by a
+//! quiet while (`Server::settled`): a marker sent through every line after
+//! what the test published, the window of a chat waited out by its own
+//! length, and every send the pipeline began seen to its end.
 
 #[path = "support/key.rs"]
 mod key;
+#[path = "support/p8.rs"]
+mod p8;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use nostr::prelude::*;
 use nostr_sdk::local_relay::{LocalRelay, QueryPolicy, QueryPolicyResult};
 use serde_json::{json, Value};
@@ -19,22 +28,35 @@ use tokio::sync::watch;
 use vpush_proto::Prefs;
 use vpush_server::config::Config;
 use vpush_server::counters::Counters;
+use vpush_server::delivery::apns::{ApnsClient, SigningKey};
 use vpush_server::delivery::fcm::{FcmClient, ServiceAccount};
 use vpush_server::delivery::retry::RetryPolicy;
-use vpush_server::delivery::Providers;
+use vpush_server::delivery::{
+    CheckFuture, Message, Outcome, ProviderKind, Providers, PushProvider, SendFuture, Target,
+};
 use vpush_server::pipeline::classify::mark_of;
 use vpush_server::pipeline::{Dealt, Pipeline, Waking};
 use vpush_server::relays::{normalize, RelayPolicy};
 use vpush_server::auth::sha256_hex;
 use vpush_server::store::{
-    AllStore, DeviceInput, DeviceLimits, Seen, SqliteStore, Store, WatchStore, WatchedGroup,
+    AllStore, Counts, Device, DeviceInput, DeviceLimits, Recipient, RelayPlan, Seen, SqliteStore,
+    Store, Ticket, TicketGone, TicketInput, TicketRef, WatchKind, WatchStore, WatchedGroup,
     WatchedRelay,
 };
 use vpush_server::relay::{Tuning, Watch};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// The one deadline of the waits: a loaded host makes everything slow, and
+/// what does not happen within it is not going to.
+const WAIT: Duration = Duration::from_secs(30);
+/// A window of a chat that stays open for the whole of a test: what it
+/// holds back is not pushed while the test looks.
+const HOUR: Duration = Duration::from_secs(3600);
+
 const APP: &str = "net.veydan.mobile";
+/// An app whose devices are pushed to through APNs.
+const IOS: &str = "net.veydan.ios";
 const SEND: &str = "/v1/projects/veydan-test/messages:send";
 const GROUP: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
@@ -42,6 +64,8 @@ struct Relay {
     relay: LocalRelay,
     url: String,
     asked: Asked,
+    /// The address the server knows, when it is not the relay's own.
+    door: Option<Door>,
 }
 
 /// How many times a relay was asked for direct messages. The server asks
@@ -81,12 +105,66 @@ async fn relay() -> Relay {
         match relay.run().await {
             Ok(()) => {
                 let url = normalize(relay.url().await.as_str()).unwrap();
-                return Relay { relay, url, asked };
+                return Relay { relay, url, asked, door: None };
             }
             Err(e) => last = Some(e),
         }
     }
     panic!("no port for the local relay: {last:?}");
+}
+
+/// A relay behind an address the test holds for as long as it runs, so it
+/// can go away and come back at that address: a relay bound anew to the
+/// port it had would find the port taken by whatever ran next to the test
+/// in between. The door passes every connection on to the relay of the
+/// moment; while there is none it closes them as they come.
+async fn relay_behind_a_door() -> Relay {
+    let mut relay = relay().await;
+    let door = Door::open(&relay).await;
+    relay.url = door.url.clone();
+    relay.door = Some(door);
+    relay
+}
+
+struct Door {
+    url: String,
+    state: Arc<Mutex<DoorState>>,
+}
+
+#[derive(Default)]
+struct DoorState {
+    /// The relay of the moment, by its own address.
+    to: Option<SocketAddr>,
+    passing: Vec<tokio::task::AbortHandle>,
+}
+
+impl Door {
+    async fn open(relay: &Relay) -> Door {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = normalize(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let state = Arc::new(Mutex::new(DoorState { to: Some(Self::address(relay).await), passing: Vec::new() }));
+        let shared = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else { return };
+                let mut state = shared.lock().unwrap();
+                let Some(to) = state.to else { continue };
+                let passing = tokio::spawn(async move {
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(to).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+                state.passing.push(passing.abort_handle());
+            }
+        });
+        Door { url, state }
+    }
+
+    async fn address(relay: &Relay) -> SocketAddr {
+        let url = relay.relay.url().await;
+        let url = url.as_str().trim_end_matches('/');
+        url.trim_start_matches("ws://").parse().unwrap()
+    }
 }
 
 impl Relay {
@@ -98,33 +176,235 @@ impl Relay {
         self.asked.0.load(Ordering::Relaxed)
     }
 
-    /// The relay goes off the line, as when it is restarted.
+    /// The relay goes off the line, as when it is restarted: what is
+    /// connected is cut, and what connects is closed at once.
     fn goes_away(&self) {
+        let door = self.door.as_ref().expect("a relay that goes away is behind a door");
+        let mut state = door.state.lock().unwrap();
+        state.to = None;
+        for passing in state.passing.drain(..) {
+            passing.abort();
+        }
         self.relay.shutdown();
     }
 
     /// A relay at the same address again, with nothing stored.
     async fn comes_back(&self) -> Relay {
-        let port: u16 = self.url.rsplit(':').next().unwrap().parse().unwrap();
-        let mut last = None;
-        for _ in 0..50 {
-            let relay = LocalRelay::builder().port(port).build();
-            match relay.run().await {
-                Ok(()) => return Relay { relay, url: self.url.clone(), asked: Asked::default() },
-                Err(e) => last = Some(e),
+        let door = self.door.as_ref().expect("a relay that comes back is behind a door");
+        let mut back = relay().await;
+        let to = Door::address(&back).await;
+        back.url = door.url.clone();
+        back.door = Some(Door { url: door.url.clone(), state: Arc::clone(&door.state) });
+        door.state.lock().unwrap().to = Some(to);
+        back
+    }
+}
+
+/// What the store of the server was asked, as far as the tests wait on it.
+#[derive(Default)]
+struct Noted {
+    /// Every event the pipeline dealt with: it notes each, whatever
+    /// becomes of it.
+    events: Mutex<HashSet<String>>,
+    /// Outcomes of pushes written down: the last step of every send.
+    outcomes: AtomicUsize,
+    /// Times the watcher read the plan and gave the relays their parts.
+    plans: AtomicUsize,
+}
+
+impl Noted {
+    fn dealt_with(&self, id: &EventId) -> bool {
+        self.events.lock().unwrap().contains(&id.to_hex())
+    }
+}
+
+/// The store of the server as it is, and a note of what the tests wait on.
+struct Witness {
+    store: Arc<SqliteStore>,
+    noted: Arc<Noted>,
+}
+
+#[async_trait]
+impl Store for Witness {
+    async fn put_device(&self, device: DeviceInput, limits: DeviceLimits) -> vpush_server::store::Result<()> {
+        self.store.put_device(device, limits).await
+    }
+    async fn device(&self, pubkey: &str, device_id: &str) -> vpush_server::store::Result<Option<Device>> {
+        self.store.device(pubkey, device_id).await
+    }
+    async fn devices_of(&self, pubkey: &str) -> vpush_server::store::Result<Vec<Device>> {
+        self.store.devices_of(pubkey).await
+    }
+    async fn delete_device(&self, pubkey: &str, device_id: &str) -> vpush_server::store::Result<bool> {
+        self.store.delete_device(pubkey, device_id).await
+    }
+    async fn forget_owner(&self, pubkey: &str) -> vpush_server::store::Result<u64> {
+        self.store.forget_owner(pubkey).await
+    }
+    async fn record_outcome(
+        &self,
+        pubkey: &str,
+        device_id: &str,
+        token: &str,
+        outcome: &str,
+        now: u64,
+    ) -> vpush_server::store::Result<()> {
+        let written = self.store.record_outcome(pubkey, device_id, token, outcome, now).await;
+        self.noted.outcomes.fetch_add(1, Ordering::SeqCst);
+        written
+    }
+    async fn purge_expired(&self, now: u64) -> vpush_server::store::Result<u64> {
+        self.store.purge_expired(now).await
+    }
+    async fn counts(&self) -> vpush_server::store::Result<Counts> {
+        self.store.counts().await
+    }
+    async fn issue_ticket(
+        &self,
+        pubkey: &str,
+        device_id: &str,
+        ticket: &TicketInput,
+        per_device: u32,
+    ) -> vpush_server::store::Result<()> {
+        self.store.issue_ticket(pubkey, device_id, ticket, per_device).await
+    }
+    async fn tickets_of(&self, pubkey: &str, now: u64) -> vpush_server::store::Result<Vec<Ticket>> {
+        self.store.tickets_of(pubkey, now).await
+    }
+    async fn delete_ticket(&self, pubkey: &str, which: &TicketRef) -> vpush_server::store::Result<TicketGone> {
+        self.store.delete_ticket(pubkey, which).await
+    }
+    async fn ticket_device(&self, hash: &str, now: u64) -> vpush_server::store::Result<Option<Recipient>> {
+        self.store.ticket_device(hash, now).await
+    }
+    async fn ticket_woken(&self, hash: &str, now: u64) -> vpush_server::store::Result<()> {
+        self.store.ticket_woken(hash, now).await
+    }
+    async fn purge_tickets(&self, now: u64) -> vpush_server::store::Result<u64> {
+        self.store.purge_tickets(now).await
+    }
+}
+
+#[async_trait]
+impl WatchStore for Witness {
+    async fn watch_plan(&self, now: u64) -> vpush_server::store::Result<Vec<RelayPlan>> {
+        self.store.watch_plan(now).await
+    }
+    async fn baselined(&self, url: &str) -> vpush_server::store::Result<Vec<(WatchKind, String)>> {
+        self.store.baselined(url).await
+    }
+    async fn set_baselined(&self, url: &str, targets: &[(WatchKind, String)], now: u64) -> vpush_server::store::Result<()> {
+        self.store.set_baselined(url, targets, now).await
+    }
+    async fn unset_baselined(&self, url: &str, targets: &[(WatchKind, String)]) -> vpush_server::store::Result<()> {
+        self.store.unset_baselined(url, targets).await
+    }
+    /// The watcher calls it in every reading of the plan, after the relays
+    /// that are let go are gone and before the others are given their
+    /// parts, which takes no wait: by the time the test runs again after
+    /// it is counted, every relay has its part.
+    async fn keep_baselined(&self, urls: &[String]) -> vpush_server::store::Result<u64> {
+        let kept = self.store.keep_baselined(urls).await;
+        self.noted.plans.fetch_add(1, Ordering::SeqCst);
+        kept
+    }
+    async fn first_seen(&self, event_id: &str, what: Seen, now: u64) -> vpush_server::store::Result<bool> {
+        self.noted.events.lock().unwrap().insert(event_id.to_string());
+        self.store.first_seen(event_id, what, now).await
+    }
+    async fn purge_seen(&self, before: u64) -> vpush_server::store::Result<u64> {
+        self.store.purge_seen(before).await
+    }
+    async fn dm_recipients(&self, pubkey: &str, now: u64) -> vpush_server::store::Result<Vec<Recipient>> {
+        self.store.dm_recipients(pubkey, now).await
+    }
+    async fn group_keys(&self, group_id: &str, now: u64, limit: usize) -> vpush_server::store::Result<Vec<String>> {
+        self.store.group_keys(group_id, now, limit).await
+    }
+    async fn group_recipients(
+        &self,
+        group_id: &str,
+        keys: &[String],
+        now: u64,
+    ) -> vpush_server::store::Result<Vec<Recipient>> {
+        self.store.group_recipients(group_id, keys, now).await
+    }
+    async fn relay_alive(&self, url: &str, now: u64) -> vpush_server::store::Result<()> {
+        self.store.relay_alive(url, now).await
+    }
+    async fn relay_last_alive(&self, url: &str) -> vpush_server::store::Result<Option<u64>> {
+        self.store.relay_last_alive(url).await
+    }
+}
+
+/// Attempts of pushes begun and ended, of every service.
+#[derive(Default)]
+struct Flight {
+    begun: AtomicUsize,
+    ended: AtomicUsize,
+    /// Attempts the service asked to have made again. None of the mocks
+    /// does, and a send between two attempts is out of sight of the count
+    /// above, so a fence that meets one says so.
+    retried: AtomicUsize,
+}
+
+/// A push service as it is, with its attempts counted.
+struct Counted {
+    service: Arc<dyn PushProvider>,
+    flight: Arc<Flight>,
+}
+
+/// Counts an attempt as ended however it ends, dropped half-way too.
+struct Ended(Arc<Flight>);
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.ended.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl PushProvider for Counted {
+    fn kind(&self) -> ProviderKind {
+        self.service.kind()
+    }
+
+    fn send<'a>(&'a self, target: &'a Target, message: &'a Message) -> SendFuture<'a> {
+        // Counted when the attempt is made, before anything is awaited: a
+        // send polled once has begun.
+        self.flight.begun.fetch_add(1, Ordering::SeqCst);
+        let ended = Ended(Arc::clone(&self.flight));
+        let attempt = self.service.send(target, message);
+        let flight = Arc::clone(&self.flight);
+        Box::pin(async move {
+            let _ended = ended;
+            let attempt = attempt.await;
+            if attempt.outcome == Outcome::Retry {
+                flight.retried.fetch_add(1, Ordering::SeqCst);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        panic!("the relay did not come back on its port: {last:?}");
+            attempt
+        })
+    }
+
+    fn check<'a>(&'a self, target: &'a Target) -> CheckFuture<'a> {
+        self.service.check(target)
     }
 }
 
 /// The server, without its HTTP side: a store, a watcher and a pipeline.
 struct Server {
     store: Arc<SqliteStore>,
+    /// The same store, as the watcher and the pipelines use it.
+    witness: Arc<Witness>,
+    noted: Arc<Noted>,
+    flight: Arc<Flight>,
+    /// The relays on the list of the server, by the address it knows: the
+    /// way a fence reaches each line.
+    relays: Mutex<Vec<(String, LocalRelay)>>,
     policy: Arc<RelayPolicy>,
     providers: Arc<Providers>,
     google: MockServer,
+    /// Plays APNs, for the devices of `IOS`.
+    apple: MockServer,
     waking: Waking,
     tuning: Tuning,
     counters: Arc<Counters>,
@@ -193,14 +473,31 @@ async fn server_with(relays: &[&Relay], waking: Waking, tuning: Tuning) -> Serve
         .to_string(),
     )
     .unwrap();
+    let flight = Arc::new(Flight::default());
+    let counted = |service: Arc<dyn PushProvider>| Arc::new(Counted { service, flight: Arc::clone(&flight) });
     let mut providers = Providers::default();
-    providers.insert(APP, Arc::new(FcmClient::new(account, &google.uri()).unwrap()));
+    providers.insert(APP, counted(Arc::new(FcmClient::new(account, &google.uri()).unwrap())));
+    let apple = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&apple)
+        .await;
+    let key = SigningKey::parse(&p8::p8().0).unwrap();
+    let apns = ApnsClient::new(key, "ABC123DEFG", "TEAM123456", IOS, Some(&apple.uri())).unwrap();
+    providers.insert(IOS, counted(Arc::new(apns)));
 
+    let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+    let noted = Arc::new(Noted::default());
     let mut server = Server {
-        store: Arc::new(SqliteStore::in_memory().await.unwrap()),
+        witness: Arc::new(Witness { store: Arc::clone(&store), noted: Arc::clone(&noted) }),
+        store,
+        noted,
+        flight,
+        relays: Mutex::new(relays.iter().map(|r| (r.url.clone(), r.relay.clone())).collect()),
         policy: Arc::new(RelayPolicy::from_config(&config).unwrap()),
         providers: Arc::new(providers),
         google,
+        apple,
         waking,
         tuning,
         counters: Arc::new(Counters::default()),
@@ -214,7 +511,7 @@ impl Server {
     /// A pipeline over the server's store, pushing through its mock.
     fn pipeline(&self) -> Arc<Pipeline> {
         Pipeline::with_retry(
-            self.store.clone(),
+            self.witness.clone(),
             self.providers.clone(),
             self.waking,
             self.counters.clone(),
@@ -227,7 +524,7 @@ impl Server {
     }
 
     fn start(&mut self) {
-        let store: Arc<dyn AllStore> = self.store.clone();
+        let store: Arc<dyn AllStore> = self.witness.clone();
         let watch = Watch::new();
         let (stop, stopped) = watch::channel(false);
         let task = tokio::spawn(vpush_server::relay::run(
@@ -307,12 +604,94 @@ impl Server {
 
     async fn pushes_are(&self, count: usize) -> Vec<Value> {
         eventually(&format!("{count} pushes"), || async { self.pushes().await.len() >= count }).await;
-        // A moment more, for a push that should not have come.
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        self.settled().await;
         let pushes = self.pushes().await;
         assert_eq!(pushes.len(), count, "{pushes:#?}");
         pushes
     }
+
+    /// Whatever the server was to push of what came before now is out.
+    ///
+    /// A line deals with what its relay sends one thing at a time, in the
+    /// order it came, so when a marker published after everything else has
+    /// been dealt with, so has everything before it; the marker is marked
+    /// as not worth a push and pushes nothing itself. What the pipeline
+    /// counted for the end of a window is pushed when the window ends, no
+    /// later than its length from now, and the length is waited out when
+    /// it is short; a window of an hour is open for the whole test. Then
+    /// every send the pipeline began is followed to its end: a send is a
+    /// task of its own, and a task woken or spawned before this one
+    /// yielded runs before it resumes, so after two passes that find no
+    /// attempt on its way and nothing begun since, none is.
+    async fn settled(&self) {
+        let plans = self.store.watch_plan(Timestamp::now().as_secs()).await.unwrap();
+        let relays: Vec<(String, LocalRelay)> = self.relays.lock().unwrap().clone();
+        let lines: Vec<String> = self.watch().health().into_iter().map(|h| h.url).collect();
+        for (url, relay) in relays {
+            // A relay nobody watches has no line, and nothing it holds
+            // reaches the server.
+            let Some(plan) = plans.iter().find(|p| p.url == url) else { continue };
+            if !lines.contains(&url) {
+                continue;
+            }
+            let marker = match (plan.dm.first(), plan.groups.first()) {
+                (Some(key), _) => silent_wrap(PublicKey::from_hex(key).unwrap()),
+                (None, Some(group)) => marked(group, &Keys::generate(), &[], &[&["silent", "1"]]),
+                (None, None) => continue,
+            };
+            relay.add_event(marker.clone()).await.unwrap();
+            eventually(&format!("the marker on {url} is dealt with"), || async {
+                self.noted.dealt_with(&marker.id)
+            })
+            .await;
+        }
+        if self.waking.chat_every <= Duration::from_secs(5) {
+            tokio::time::sleep(self.waking.chat_every).await;
+        }
+        let deadline = Instant::now() + WAIT;
+        let mut quiet = 0;
+        let mut last = None;
+        while quiet < 2 {
+            tokio::task::yield_now().await;
+            let now = (
+                self.flight.begun.load(Ordering::SeqCst),
+                self.flight.ended.load(Ordering::SeqCst),
+                self.noted.outcomes.load(Ordering::SeqCst),
+            );
+            let (begun, ended, written) = now;
+            if begun == ended && ended == written && last.is_none_or(|last| last == now) {
+                quiet += 1;
+            } else {
+                quiet = 0;
+                if Instant::now() > deadline {
+                    panic!("the sends never ended: begun {begun}, ended {ended}, outcomes written {written}");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            last = Some(now);
+        }
+        assert_eq!(self.flight.retried.load(Ordering::SeqCst), 0, "a push service asked for another attempt");
+    }
+
+    /// The watcher read the plan after this was called, and gave every
+    /// relay its part.
+    async fn plan_read(&self) {
+        let before = self.noted.plans.load(Ordering::SeqCst);
+        self.watch().plan_changed();
+        eventually("the watcher reads the plan", || async {
+            self.noted.plans.load(Ordering::SeqCst) > before
+        })
+        .await;
+    }
+}
+
+/// A direct message to `to` marked as not worth a push.
+fn silent_wrap(to: PublicKey) -> Event {
+    EventBuilder::new(Kind::GiftWrap, "sealed")
+        .tags([Tag::public_key(to), Tag::parse(["silent", "1"]).unwrap()])
+        .custom_created_at(Timestamp::from_secs(Timestamp::now().as_secs() - 86_400))
+        .finalize(&Keys::generate())
+        .unwrap()
 }
 
 /// The registration of a phone that watches direct messages and the group
@@ -344,9 +723,19 @@ where
     F: Fn() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    eventually_within(WAIT, what, check).await
+}
+
+async fn eventually_within<F, Fut>(within: Duration, what: &str, check: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    let deadline = Instant::now() + within;
     while !check().await {
-        assert!(Instant::now() < deadline, "never happened: {what}");
+        if Instant::now() > deadline {
+            panic!("never happened within {within:?}: {what}");
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -822,15 +1211,31 @@ async fn keys_made_up_for_a_group_do_not_crowd_out_the_key_of_its_members() {
     server.pushes_are(3).await;
 }
 
+/// Messages of one chat while its window is open, given to a pipeline
+/// one after another: the first is pushed, the ones after it are counted.
+async fn a_burst(server: &Server, r: &Relay, to: &Keys, tags: &[&[&str]], messages: usize) -> Vec<String> {
+    let pipeline = server.pipeline();
+    let mut ids = Vec::new();
+    for n in 0..messages {
+        let message = wrap(to, tags);
+        ids.push(message.id.to_hex());
+        let (now, later) = if n == 0 { (1, 0) } else { (0, 1) };
+        let dealt = pipeline.event(&r.url, &message, false).await;
+        assert_eq!(dealt, Dealt::Pushed { now, later, own: 0, over: 0 }, "message {n}");
+    }
+    ids
+}
+
 #[tokio::test]
 async fn a_burst_wakes_the_phone_twice_and_the_second_push_counts_the_rest() {
+    // The window is an hour: the messages after the first are held back for
+    // as long as the test looks, and what is pushed went at once.
     let r = relay().await;
-    let server = server(&[&r], Duration::from_secs(2)).await;
+    let server = server(&[&r], HOUR).await;
     let alice = Keys::generate();
     server.register(&alice, "phone", &[&r]).await;
     server.watching(&alice, &[&r]).await;
 
-    let started = Instant::now();
     let mut ids = Vec::new();
     for _ in 0..6 {
         let message = wrap(&alice, &[]);
@@ -838,17 +1243,27 @@ async fn a_burst_wakes_the_phone_twice_and_the_second_push_counts_the_rest() {
         r.publish(&message).await;
     }
     // Another chat is not held back by this one.
-    r.publish(&group_event(&Keys::generate(), &[])).await;
+    let other = group_event(&Keys::generate(), &[]);
+    r.publish(&other).await;
 
-    eventually("the pushes that go at once", || async { server.pushes().await.len() >= 2 }).await;
-    assert!(started.elapsed() < Duration::from_secs(2), "the first push does not wait");
-    let first = server.pushes().await;
-    assert_eq!(first.len(), 2, "{first:#?}");
+    let first = server.pushes_are(2).await;
+    let at_once = first.iter().map(|p| &p["data"]).find(|d| d["type"] == "dm").unwrap();
+    assert_eq!(carried(at_once)["id"], ids[0], "the first of the burst does not wait");
+    assert!(at_once.get("count").is_none(), "{at_once}");
+    let group = first.iter().map(|p| &p["data"]).find(|d| d["type"] == "group").unwrap();
+    assert_eq!(carried(group)["id"], other.id.to_hex());
 
-    let pushes = server.pushes_are(3).await;
-    assert!(started.elapsed() >= Duration::from_secs(2));
-    let at_once = pushes[..2].iter().map(|p| &p["data"]).find(|d| d["type"] == "dm").unwrap();
-    let last = &pushes[2]["data"];
+    // A window of two seconds, which ends while the test waits: the five
+    // counted are told in one push at its end.
+    let r = relay().await;
+    let server = crate::server(&[&r], Duration::from_secs(2)).await;
+    server.register(&alice, "phone", &[&r]).await;
+    let ids = a_burst(&server, &r, &alice, &[], 6).await;
+
+    let pushes = server.pushes_are(2).await;
+    let at_once = pushes.iter().map(|p| &p["data"]).find(|d| d.get("count").is_none()).unwrap();
+    assert_eq!(carried(at_once)["id"], ids[0]);
+    let last = pushes.iter().map(|p| &p["data"]).find(|d| d.get("count").is_some()).unwrap();
     assert_eq!(last["type"], "dm");
     assert_eq!(last["count"], "5");
     // Five messages cannot be shown from one event: the push names one of
@@ -860,21 +1275,21 @@ async fn a_burst_wakes_the_phone_twice_and_the_second_push_counts_the_rest() {
     assert_ne!(carried(at_once)["id"], named, "and not the one pushed at once");
 }
 
+/// Both go at once: in one lane the message would wait for the note's
+/// window, an hour here.
 #[tokio::test]
 async fn a_channel_note_and_a_message_use_separate_push_lanes() {
     let r = relay().await;
-    let server = server(&[&r], Duration::from_secs(2)).await;
+    let server = server(&[&r], HOUR).await;
     let owner = Keys::generate();
     server.register(&owner, "phone", &[&r]).await;
     server.watching(&owner, &[&r]).await;
 
     let note = wrap(&owner, &[&["channel", "1"]]);
     let message = wrap(&owner, &[]);
-    let started = Instant::now();
     r.publish(&note).await;
     r.publish(&message).await;
     let pushes = server.pushes_are(2).await;
-    assert!(started.elapsed() < Duration::from_secs(2));
     let channel = pushes.iter().find(|p| p["data"]["channel"] == "1").unwrap();
     let dm = pushes.iter().find(|p| p["data"].get("channel").is_none()).unwrap();
     assert_eq!(channel["data"]["type"], "dm");
@@ -887,15 +1302,30 @@ async fn a_channel_note_and_a_message_use_separate_push_lanes() {
 
 #[tokio::test]
 async fn three_channel_notes_count_only_channel_notes() {
+    // While the window is open (an hour) the two after the first are held,
+    // and a message of the owner's other lane is not counted with them.
     let r = relay().await;
-    let server = server(&[&r], Duration::from_secs(2)).await;
+    let server = server(&[&r], HOUR).await;
     let owner = Keys::generate();
     server.register(&owner, "phone", &[&r]).await;
     server.watching(&owner, &[&r]).await;
 
-    for _ in 0..3 {
-        r.publish(&wrap(&owner, &[&["channel", "1"]])).await;
+    let notes: Vec<Event> = (0..3).map(|_| wrap(&owner, &[&["channel", "1"]])).collect();
+    for note in &notes {
+        r.publish(note).await;
     }
+    let pushes = server.pushes_are(1).await;
+    assert_eq!(pushes[0]["data"]["channel"], "1");
+    assert_eq!(carried(&pushes[0]["data"])["id"], notes[0].id.to_hex());
+    r.publish(&wrap(&owner, &[])).await;
+    let pushes = server.pushes_are(2).await;
+    assert!(pushes[1]["data"].get("channel").is_none() && pushes[1]["data"].get("count").is_none());
+
+    // When the window ends (two seconds) the two are told in one push.
+    let r = relay().await;
+    let server = crate::server(&[&r], Duration::from_secs(2)).await;
+    server.register(&owner, "phone", &[&r]).await;
+    a_burst(&server, &r, &owner, &[&["channel", "1"]], 3).await;
     let pushes = server.pushes_are(2).await;
     assert!(pushes.iter().all(|p| p["data"]["type"] == "dm" && p["data"]["channel"] == "1"));
     let first = pushes.iter().find(|p| p["data"].get("count").is_none()).unwrap();
@@ -906,9 +1336,23 @@ async fn three_channel_notes_count_only_channel_notes() {
 
 #[tokio::test]
 async fn ordinary_messages_still_share_one_push_lane() {
+    // One lane: while the window of the first is open (an hour) the second
+    // waits for it.
     let r = relay().await;
-    let server = server(&[&r], Duration::from_secs(2)).await;
+    let server = server(&[&r], HOUR).await;
     let owner = Keys::generate();
+    server.register(&owner, "phone", &[&r]).await;
+    server.watching(&owner, &[&r]).await;
+    let first = wrap(&owner, &[]);
+    r.publish(&first).await;
+    r.publish(&wrap(&owner, &[])).await;
+    let pushes = server.pushes_are(1).await;
+    assert_eq!(carried(&pushes[0]["data"])["id"], first.id.to_hex());
+
+    // And when the window ends (two seconds) the second is told by itself,
+    // under the same key.
+    let r = relay().await;
+    let server = crate::server(&[&r], Duration::from_secs(2)).await;
     server.register(&owner, "phone", &[&r]).await;
     server.watching(&owner, &[&r]).await;
 
@@ -929,14 +1373,14 @@ async fn ordinary_messages_still_share_one_push_lane() {
 #[tokio::test]
 async fn a_call_goes_past_the_throttle_and_lives_a_minute() {
     let r = relay().await;
-    let server = server(&[&r], Duration::from_secs(2)).await;
+    let server = server(&[&r], HOUR).await;
     let alice = Keys::generate();
     server.register(&alice, "phone", &[&r]).await;
     server.watching(&alice, &[&r]).await;
 
-    let started = Instant::now();
     // A message wakes the phone and starts the window of the chat; a
-    // second message would be counted and told after the window.
+    // second message would be counted and told after the window, an hour
+    // from now: the calls that are pushed did not wait for it.
     r.publish(&wrap(&alice, &[])).await;
     let invite = wrap(&alice, &[&["call", "1"]]);
     r.publish(&invite).await;
@@ -944,7 +1388,6 @@ async fn a_call_goes_past_the_throttle_and_lives_a_minute() {
     r.publish(&again).await;
 
     let pushes = server.pushes_are(3).await;
-    assert!(started.elapsed() < Duration::from_secs(2), "the calls did not wait for the window");
     let calls: Vec<&Value> = pushes.iter().filter(|p| p["android"]["ttl"] == "60s").collect();
     assert_eq!(calls.len(), 2, "{pushes:#?}");
     let ids: Vec<Value> = calls.iter().map(|p| carried(&p["data"])["id"].clone()).collect();
@@ -971,7 +1414,7 @@ async fn a_call_goes_past_the_throttle_and_lives_a_minute() {
 #[tokio::test]
 async fn a_flood_of_calls_rings_the_phone_a_few_times_a_minute() {
     let r = relay().await;
-    let mut waking = waking(Duration::from_secs(2));
+    let mut waking = waking(HOUR);
     waking.call_cap = 2;
     let server = server_with(&[&r], waking, at_once()).await;
     let alice = Keys::generate();
@@ -1004,14 +1447,14 @@ async fn a_flood_of_calls_rings_the_phone_a_few_times_a_minute() {
 #[tokio::test]
 async fn the_end_of_a_ringing_goes_like_a_call_on_its_own_budget() {
     let r = relay().await;
-    let mut waking = waking(Duration::from_secs(2));
+    // A window of an hour: what is pushed went at once.
+    let mut waking = waking(HOUR);
     waking.call_cap = 1;
     let server = server_with(&[&r], waking, at_once()).await;
     let alice = Keys::generate();
     server.register(&alice, "phone", &[&r]).await;
     server.watching(&alice, &[&r]).await;
 
-    let started = Instant::now();
     let ring = wrap(&alice, &[&["call", "1"]]);
     r.publish(&ring).await;
     let end = wrap(&alice, &[&["call", "0"]]);
@@ -1021,7 +1464,6 @@ async fn the_end_of_a_ringing_goes_like_a_call_on_its_own_budget() {
     r.publish(&wrap(&alice, &[&["call", "0"]])).await;
 
     let pushes = server.pushes_are(2).await;
-    assert!(started.elapsed() < Duration::from_secs(2), "the end did not wait for the window");
     let ids: Vec<Value> = pushes.iter().map(|p| carried(&p["data"])["id"].clone()).collect();
     assert!(ids.contains(&json!(ring.id.to_hex())) && ids.contains(&json!(end.id.to_hex())), "{ids:?}");
     for push in &pushes {
@@ -1058,7 +1500,6 @@ async fn what_came_while_the_server_was_away_is_pushed_once_when_it_is_back() {
     r.publish(&missed).await;
     let missed_in_group = group_event(&Keys::generate(), &[]);
     r.publish(&missed_in_group).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
     server.start();
 
     let pushes = server.pushes_are(3).await;
@@ -1080,8 +1521,8 @@ async fn a_device_that_leaves_takes_nothing_from_the_one_that_stays() {
     server.watching(&alice, &[&r]).await;
 
     assert!(server.store.delete_device(&owner, "tablet").await.unwrap());
-    server.watch().plan_changed();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The relay has its part of the plan as it is without the tablet.
+    server.plan_read().await;
 
     r.publish(&wrap(&alice, &[])).await;
     let pushes = server.pushes_are(1).await;
@@ -1221,7 +1662,7 @@ async fn a_relay_that_is_not_on_the_list_is_not_connected_to() {
 
 #[tokio::test]
 async fn who_registers_while_a_relay_is_away_is_watched_when_it_is_back() {
-    let r = relay().await;
+    let r = relay_behind_a_door().await;
     let server = server(&[&r], SHORT).await;
     let alice = Keys::generate();
     server.register(&alice, "phone", &[&r]).await;
@@ -1230,22 +1671,31 @@ async fn who_registers_while_a_relay_is_away_is_watched_when_it_is_back() {
     // The relay is away when somebody new registers: the request for their
     // key waits for it.
     r.goes_away();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    eventually("the server sees the relay away", || async {
+        server.watch().health().iter().any(|h| h.url == r.url && h.state == "disconnected")
+    })
+    .await;
     let bob = Keys::generate();
     server.register(&bob, "bob-phone", &[&r]).await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The door stays closed until the relay comes back, so the line takes
+    // the new key while the relay is away.
+    eventually("the line takes the new key", || async {
+        server.watch().health().iter().any(|h| h.url == r.url && h.dm == 2)
+    })
+    .await;
 
     // Back on the line, it is asked, not within the hour but at once. The
-    // wait is the library's own before it tries the relay again. (A relay
+    // wait is the library's own before it tries the relay again, which
+    // grows with every try that failed: a minute is given to it. (A relay
     // that failed for so long that the library refuses requests for it is
     // not played here: that takes minutes. `Line::unsent` is for it.)
     let r = r.comes_back().await;
+    server.relays.lock().unwrap()[0].1 = r.relay.clone();
     let bob_key = bob.public_key().to_hex();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !server.knows(&r, &bob_key).await {
-        assert!(Instant::now() < deadline, "the relay was never asked about the new key");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    eventually_within(2 * WAIT, "the relay is asked about the new key", || async {
+        server.knows(&r, &bob_key).await
+    })
+    .await;
 
     r.publish(&wrap(&bob, &[])).await;
     server.pushes_are(1).await;
@@ -1256,8 +1706,10 @@ async fn who_registers_while_a_relay_is_away_is_watched_when_it_is_back() {
 #[tokio::test]
 async fn a_burst_of_registrations_makes_a_relay_be_asked_twice_and_no_more() {
     let r = relay().await;
+    // Longer than the three readings of the plan below take, so that all
+    // of them come within one wait of the line.
     let tuning = Tuning {
-        ask_every: Duration::from_secs(4),
+        ask_every: Duration::from_secs(8),
         ..Tuning::default()
     };
     let server = server_with(&[&r], waking(SHORT), tuning).await;
@@ -1266,15 +1718,16 @@ async fn a_burst_of_registrations_makes_a_relay_be_asked_twice_and_no_more() {
     server.watching(&first, &[&r]).await;
     assert_eq!(r.asked_for_direct_messages(), 1);
 
-    // Registrations for longer than a second. The watcher reads them
-    // every second, and what is watched on the relay is another thing
-    // every time it does.
+    // Registrations in three rounds, each read by the watcher before the
+    // next: what is watched on the relay is another thing three times.
     let mut owners = Vec::new();
-    for n in 1..=8 {
-        let owner = Keys::generate();
-        server.register(&owner, &format!("phone-{n}"), &[&r]).await;
-        owners.push(owner);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    for round in [1..=3, 4..=6, 7..=8] {
+        for n in round {
+            let owner = Keys::generate();
+            server.register(&owner, &format!("phone-{n}"), &[&r]).await;
+            owners.push(owner);
+        }
+        server.plan_read().await;
     }
     for owner in &owners {
         server.watching(owner, &[&r]).await;
@@ -1293,24 +1746,23 @@ async fn a_burst_of_registrations_makes_a_relay_be_asked_twice_and_no_more() {
     assert_eq!(r.asked_for_direct_messages(), 2);
 }
 
-#[tokio::test]
-async fn a_device_is_pushed_to_thirty_times_and_told_of_the_rest_in_one_push() {
+/// A phone of forty chats, and a message in every one of them at once,
+/// straight to the pipeline: thirty are pushed, ten come over the cap.
+async fn forty_chats_at_once(device_window: Duration) -> Server {
     let r = relay().await;
     let cap = Waking {
         chat_every: SHORT,
         device_cap: 30,
-        device_window: Duration::from_secs(2),
+        device_window,
         ..waking(SHORT)
     };
     let server = server_with(&[&r], cap, at_once()).await;
     let alice = Keys::generate();
-    // Forty chats of one phone.
     let groups: Vec<String> = (1..=40).map(|n| format!("{n:064x}")).collect();
     let mut input = phone(&alice, "phone", &[&r]);
     input.groups = groups.iter().map(|group| member_of(group)).collect();
     server.put(input).await;
 
-    // Straight to the pipeline: a message in every one of them, at once.
     let pipeline = server.pipeline();
     let mut pushed = Vec::new();
     for group in &groups {
@@ -1321,14 +1773,23 @@ async fn a_device_is_pushed_to_thirty_times_and_told_of_the_rest_in_one_push() {
     let counted = Dealt::Pushed { now: 0, later: 0, own: 0, over: 1 };
     assert!(pushed[..30].iter().all(|dealt| *dealt == at_once), "{pushed:?}");
     assert!(pushed[30..].iter().all(|dealt| *dealt == counted), "{pushed:?}");
+    server
+}
 
+#[tokio::test]
+async fn a_device_is_pushed_to_thirty_times_and_told_of_the_rest_in_one_push() {
+    // Within the window of the device, an hour here, the thirty are pushed
+    // and the ten wait.
+    let server = forty_chats_at_once(HOUR).await;
     let pushes = server.pushes_are(30).await;
     assert!(pushes.iter().all(|p| p["data"]["type"] == "group"), "{pushes:#?}");
     assert_eq!(server.counters.sync_pushes.get(), 0, "the rest is told when the time is up");
 
-    // The ten that came over the cap: one push, which says how many and
-    // nothing of any one of them.
+    // The ten that came over the cap: one push when the window of two
+    // seconds is over, which says how many and nothing of any one of them.
+    let server = forty_chats_at_once(Duration::from_secs(2)).await;
     let pushes = server.pushes_are(31).await;
+    assert!(pushes[..30].iter().all(|p| p["data"]["type"] == "group"), "{pushes:#?}");
     let sync = &pushes[30];
     assert_eq!(sync["token"], "token-of-phone");
     let data = sync["data"].as_object().unwrap();
@@ -1368,7 +1829,7 @@ async fn a_line_with_more_to_deal_with_than_it_has_room_for_starts_over_and_lose
     server.start();
 
     eventually("every message is told", || async { server.told().await >= 60 }).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.settled().await;
     assert_eq!(server.told().await, 60, "every one of them, and none of them twice");
     assert!(
         server.counters.lines_started_over.get() >= 1,
@@ -1404,11 +1865,78 @@ async fn a_burst_bigger_than_the_channel_of_nostr_sdk_loses_nothing() {
     server.start();
 
     eventually("every message is told", || async { server.told().await >= 60 }).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.settled().await;
     assert_eq!(server.told().await, 60);
     assert_eq!(
         server.counters.lines_started_over.get(),
         0,
         "the queue had room for all of them: nothing was lost, and nothing was asked for again"
     );
+}
+
+/// What APNs was handed: the push type, the priority and the body.
+async fn apple_got(server: &Server, count: usize) -> Vec<(String, String, Value)> {
+    eventually(&format!("{count} pushes to APNs"), || async {
+        server.apple.received_requests().await.unwrap().len() >= count
+    })
+    .await;
+    server.settled().await;
+    let got: Vec<_> = server
+        .apple
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let header = |name: &str| r.headers[name].to_str().unwrap().to_string();
+            (
+                header("apns-push-type"),
+                header("apns-priority"),
+                serde_json::from_slice::<Value>(&r.body).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(got.len(), count, "{got:#?}");
+    got
+}
+
+/// A note to the keeper of a channel (`["channel", "1"]` on the wrap) wakes
+/// an iPhone in the background, with nothing to show; a message is an alert
+/// the extension of the app writes. Both carry the event, as through FCM.
+#[tokio::test]
+async fn a_note_to_a_keeper_wakes_an_iphone_in_the_background() {
+    let r = relay().await;
+    let server = server(&[&r], SHORT).await;
+    let alice = Keys::generate();
+    let mut iphone = phone(&alice, "iphone", &[&r]);
+    iphone.app_id = IOS.to_string();
+    iphone.provider = "apns".to_string();
+    iphone.token = "ab".repeat(32);
+    iphone.channel_json = Some(format!(
+        r#"{{"provider":"apns","token":"{}","environment":"sandbox"}}"#,
+        "ab".repeat(32)
+    ));
+    server.put(iphone).await;
+    server.watching(&alice, &[&r]).await;
+
+    let note = wrap(&alice, &[&["channel", "1"]]);
+    r.publish(&note).await;
+    let got = apple_got(&server, 1).await;
+    let (kind, priority, body) = &got[0];
+    assert_eq!((kind.as_str(), priority.as_str()), ("background", "5"));
+    assert_eq!(body["aps"], json!({ "content-available": 1 }));
+    assert_eq!(carried(body)["id"], note.id.to_hex());
+
+    // The window of the chat is short, and over: `apple_got` waited it out.
+    // The message after it goes at once.
+    let message = wrap(&alice, &[]);
+    r.publish(&message).await;
+    let got = apple_got(&server, 2).await;
+    let (kind, priority, body) = &got[1];
+    assert_eq!((kind.as_str(), priority.as_str()), ("alert", "10"));
+    assert_eq!(body["aps"]["mutable-content"], 1);
+    assert_eq!(body["aps"]["alert"]["loc-key"], "push.new");
+    assert!(body["aps"]["thread-id"].is_string(), "the chat, which groups its notifications");
+    assert_eq!(carried(body)["id"], message.id.to_hex());
+    assert!(server.pushes().await.is_empty(), "nothing went to FCM");
 }

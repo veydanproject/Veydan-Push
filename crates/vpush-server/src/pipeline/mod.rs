@@ -489,6 +489,7 @@ impl Pipeline {
             collapse_key: Some(Self::collapse(PushType::Sync.as_str())),
             ttl: TTL,
             urgent: true,
+            background: false,
         }
     }
 
@@ -534,6 +535,9 @@ impl Pipeline {
             collapse_key: Some(Self::collapse(&order.chat())),
             ttl: TTL,
             urgent: true,
+            // A channel note, by itself, is a wake with nothing to show;
+            // counted with others, the push is about them too.
+            background: order.channel && count == 1 && !call,
         }
     }
 
@@ -573,6 +577,7 @@ impl Pipeline {
             let target = Target {
                 token: to.token.clone(),
                 seal_to: to.seal_to.clone(),
+                sandbox: to.sandbox,
             };
             let provider = to
                 .provider

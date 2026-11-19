@@ -256,10 +256,47 @@ install -m 0600 -o vpush -g vpush fcm-veydan.json /opt/vpush/etc/secrets/
 `check-config` reads the file and checks the key in it. A file that is
 missing or is not a service account stops the start, with the reason.
 
+An iOS app is pushed to through APNs, with a key of the Apple developer
+account of its team: Certificates, Identifiers & Profiles → Keys → the key
+with Apple Push Notifications service (APNs) enabled. Apple gives the `.p8`
+file once; its Key ID is shown beside it, and the Team ID at the top right
+of the account. One key pushes to every app of the team, in production and
+in the sandbox alike.
+
+```toml
+[apps."net.veydan.mobile".apns]
+key_file = "/opt/vpush/etc/secrets/apns-net.veydan.mobile.p8"
+key_id = "ABC123DEFG"
+team_id = "TEAM123456"
+topic = "net.veydan.mobile"
+```
+
+```
+install -m 0600 -o vpush -g vpush AuthKey_ABC123DEFG.p8 /opt/vpush/etc/secrets/apns-net.veydan.mobile.p8
+```
+
+`check-config` reads the key: one that is missing, not PKCS#8 PEM or not
+an ES256 (P-256) key stops the start, with the reason. The server makes its
+provider token from it (a JWT, ES256, the key id and the team), uses it for
+50 minutes and makes the next one: Apple refuses a token older than an
+hour, and one made more often than every 20 minutes. The connection is
+HTTP/2, which APNs speaks alone.
+
+The device says at registration whether its token is of `production` (a
+build of the App Store or TestFlight) or of the `sandbox` (a build signed
+for development), and every push to it goes to the host of that
+environment. Both are served with the same key; nothing in the config
+chooses. A token pushed to the other host is answered `BadDeviceToken`,
+and the device is marked dead until it registers a new token: APNs cannot
+be asked about one, so the same token registered again stays dead.
+
 | Key | Meaning |
 |---|---|
 | `apps.<id>.fcm.service_account` | Path of the service account file |
-| `apps.<id>.apns.*` | Read and checked; delivery to iOS is not built yet |
+| `apps.<id>.apns.key_file` | Path of the `.p8` key of APNs |
+| `apps.<id>.apns.key_id` | Its Key ID |
+| `apps.<id>.apns.team_id` | The Team ID of the developer account |
+| `apps.<id>.apns.topic` | The bundle id of the app |
 
 After a change: `systemctl restart vpush`.
 
@@ -354,9 +391,12 @@ A bare `404` of the gateway (a wrong `gateway.url`) is `rejected`, never
 
 ```
 make server-ctl ARGS="test-push --app net.veydan.mobile --token <token of the device>"
+make server-ctl ARGS="test-push --app net.veydan.mobile --provider apns --token <hex> [--sandbox]"
 ```
 
 The push carries no text: the phone shows a test push in its own words.
+Through APNs it is an alert the extension of the app writes; `--sandbox`
+sends it to the sandbox of APNs, for a build signed for development.
 
 A test push is tried once, and given up on after ten seconds: whoever asked
 is waiting. The answer says what came of the attempt:
@@ -382,8 +422,12 @@ and is not pushed to until it registers a new token:
 | `SENDER_ID_MISMATCH` | The token is of another Firebase project than the service account |
 | `INVALID_ARGUMENT` | The token is not a token. FCM says the same of a push that is too big, so a push that carried the event is first sent once more without it, and only a push refused without the event means the token |
 
-Such a device comes back without a new token too: when it registers again
-and FCM vouches for the token it has, it is `active`.
+| `Unregistered` (APNs, `410`) | The token is gone: the app was removed, or was given a new one |
+| `BadDeviceToken` (APNs, `400`) | The token is not one, or is of the other environment: a token of the sandbox pushed to production, or the other way round |
+
+Such a device of FCM comes back without a new token too: when it registers
+again and FCM vouches for the token it has, it is `active`. A device of
+APNs comes back with a new token only.
 
 Codes of `rejected` and `retry`:
 
@@ -396,6 +440,11 @@ Codes of `rejected` and `retry`:
 | `QUOTA_EXCEEDED` | Too many pushes; FCM says when to come back |
 | `UNREACHABLE` | No connection to FCM from this server |
 | `DEADLINE` | A test push got no answer from the service in ten seconds |
+| `ExpiredProviderToken`, `InvalidProviderToken` (APNs, `403`) | APNs refuses the provider token: made anew and the push sent once more, refused again. The clock of the server is off, or `key_id`, `team_id` or the `.p8` do not belong together |
+| `TooManyProviderTokenUpdates` (APNs, `429`) | Tokens were made too often; the next attempt is later |
+| `DeviceTokenNotForTopic`, `BadTopic`, `TopicDisallowed` (APNs, `400`) | `topic` is not the bundle id of the app the token is of, or the key is not of its team |
+| `TOO_BIG` | A push over 4096 bytes for APNs with no smaller form; not sent |
+| `NOT_A_TOKEN` | A token of APNs that is not hex; not sent |
 
 The `trace` of the answer is in the log lines of that push:
 
@@ -501,6 +550,9 @@ the device is registered all the same, and `vpush ctl devices` shows it
 with `token_checked_at: null` until FCM vouches for the token or takes a
 push for it. A registration that renews a token FCM has vouched for asks
 nobody.
+A token of APNs is not asked about: APNs has no question that sends
+nothing. The device is registered with `token_checked_at: null`, and the
+first push says what the token is worth.
 
 ## Waking a device
 

@@ -349,8 +349,12 @@ pub async fn wake(
             // it does for a call: a push service that is handed urgent
             // pushes with nothing to show soon takes them all for noise.
             urgent: wake.urgent,
+            background: false,
         };
-        let target = Target::of(device.token.clone());
+        let target = Target {
+            sandbox: device.sandbox,
+            ..Target::of(device.token.clone())
+        };
         let attempt = provider.send(&target, &message).await;
         let outcome = super::devices::outcome_name(attempt.outcome);
         // The trace, the ticket's first 8 hex and the size; of the device,

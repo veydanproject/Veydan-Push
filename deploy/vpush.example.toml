@@ -46,11 +46,17 @@ level = "info"
 # Put it in /opt/vpush/etc/secrets/, readable by the vpush user only.
 #service_account = "/opt/vpush/etc/secrets/fcm-veydan.json"
 #
-# Reserved. The section is read and checked; delivery to iOS is not built yet.
+# The key of APNs, for the iOS app: Apple developer account -> Certificates,
+# Identifiers & Profiles -> Keys -> a key with Apple Push Notifications service
+# (APNs). Apple gives the .p8 file once; the Key ID is beside it, the Team ID
+# at the top right of the account. One key serves every app of the team, in
+# production and in the sandbox: each device says which it is when it
+# registers. Put it in /opt/vpush/etc/secrets/, readable by the vpush user only.
 #[apps."net.veydan.mobile".apns]
-#key_file = "/opt/vpush/etc/secrets/apns-veydan.p8"
+#key_file = "/opt/vpush/etc/secrets/apns-net.veydan.mobile.p8"
 #key_id = "ABC123DEFG"
 #team_id = "TEAM123456"
+# The bundle id of the iOS app.
 #topic = "net.veydan.mobile"
 
 [store]

@@ -41,6 +41,9 @@ pub enum Request {
         app: String,
         provider: ProviderKind,
         token: String,
+        /// A token of APNs from the sandbox: a development build of the app.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        sandbox: bool,
     },
     /// The devices of one owner, and what is watched for each.
     Devices { owner: String },
@@ -316,7 +319,8 @@ async fn handle(request: Request, state: &AdminState) -> Response {
             app,
             provider,
             token,
-        } => test_push(state, &app, provider, token).await,
+            sandbox,
+        } => test_push(state, &app, provider, token, sandbox).await,
         Request::Devices { owner } => {
             // An owner is named as people name them: npub or hex.
             let pubkey = match nostr::key::PublicKey::parse(owner.trim()) {
@@ -364,13 +368,22 @@ async fn forget(store: &dyn Store, watch: &Watch, pubkey: String) -> Response {
     }
 }
 
-async fn test_push(state: &AdminState, app: &str, kind: ProviderKind, token: String) -> Response {
+async fn test_push(
+    state: &AdminState,
+    app: &str,
+    kind: ProviderKind,
+    token: String,
+    sandbox: bool,
+) -> Response {
     let provider = match state.providers.get(app, kind) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
     };
     let trace = crate::api::next_request_id();
-    let target = Target::of(token);
+    let target = Target {
+        sandbox,
+        ..Target::of(token)
+    };
 
     let delivery = delivery::test_push(provider.as_ref(), &target, &trace).await;
     let last = delivery.attempts.last();
@@ -500,6 +513,7 @@ mod tests {
             last_outcome: None,
             token_checked_at: None,
             seal_to: None,
+            sandbox: false,
             relays: vec![],
             groups: vec![group("11", &["c1", "c0"]), group("22", &["c1"]), group("33", &[])],
         };

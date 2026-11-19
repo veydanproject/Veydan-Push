@@ -1455,9 +1455,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2538,8 +2538,6 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi",
  "flume",
@@ -3083,12 +3081,12 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "veydan-denied"
-version = "0.1.0"
-source = "git+https://github.com/veydanproject/Veydan-Common?tag=v0.1.0#d3c9b2cc6eae443ddc557e32fc8beb2ed2e5d763"
+version = "0.1.1"
+source = "git+https://github.com/veydanproject/Veydan-Common?tag=v0.1.1#4560b035f743fd6c02202f14b35fa574da104e2f"
 
 [[package]]
 name = "vpush"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3106,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "vpush-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3114,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "vpush-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",

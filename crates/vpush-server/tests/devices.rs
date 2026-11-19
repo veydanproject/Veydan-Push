@@ -2,6 +2,8 @@
 
 #[path = "support/key.rs"]
 mod key;
+#[path = "support/p8.rs"]
+mod p8;
 
 use std::sync::Arc;
 
@@ -13,6 +15,7 @@ use vpush_server::api::{self, Api};
 use vpush_server::auth::sha256_hex;
 use vpush_server::config::Config;
 use vpush_server::counters::Counters;
+use vpush_server::delivery::apns::{ApnsClient, SigningKey};
 use vpush_server::delivery::fcm::{FcmClient, ServiceAccount};
 use vpush_server::delivery::Providers;
 use vpush_server::relays::RelayPolicy;
@@ -21,6 +24,8 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const APP: &str = "net.veydan.mobile";
+/// An app whose devices are pushed to through APNs alone.
+const IOS: &str = "net.veydan.ios";
 const SEND: &str = "/v1/projects/veydan-test/messages:send";
 
 struct Server {
@@ -31,6 +36,8 @@ struct Server {
     store: Arc<SqliteStore>,
     counters: Arc<Counters>,
     google: MockServer,
+    /// Plays APNs, for the devices of `IOS`.
+    apple: MockServer,
     /// The denied keys the server reads, to look at its file again.
     denied: Arc<veydan_denied::DeniedKeys>,
 }
@@ -68,6 +75,7 @@ async fn start_full(top: &str, more_config: &str) -> Server {
         [apps."{APP}".fcm]
         service_account = "/nowhere/fcm.json"
         [apps."app.without.push"]
+        [apps."{IOS}"]
         [[relays.allow]]
         url = "wss://node-1.veydan.net"
         [[relays.allow]]
@@ -89,6 +97,10 @@ async fn start_full(top: &str, more_config: &str) -> Server {
     .unwrap();
     let mut providers = Providers::default();
     providers.insert(APP, Arc::new(FcmClient::new(account, &google.uri()).unwrap()));
+    let apple = MockServer::start().await;
+    let key = SigningKey::parse(&p8::p8().0).unwrap();
+    let apns = ApnsClient::new(key, "ABC123DEFG", "TEAM123456", IOS, Some(&apple.uri())).unwrap();
+    providers.insert(IOS, Arc::new(apns));
 
     let store = Arc::new(SqliteStore::in_memory().await.unwrap());
     let relays = RelayPolicy::from_config(&config).unwrap();
@@ -113,6 +125,7 @@ async fn start_full(top: &str, more_config: &str) -> Server {
         store,
         counters,
         google,
+        apple,
         denied,
     }
 }
@@ -991,7 +1004,10 @@ async fn what_a_client_learns_before_it_registers() {
     let info = server.send("GET", "/v1/info", None, vec![]).await;
     assert_eq!(info.status, 200);
     assert_eq!(info.body["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(info.body["apps"], json!([{ "id": APP, "providers": ["fcm"] }]));
+    assert_eq!(
+        info.body["apps"],
+        json!([{ "id": IOS, "providers": ["apns"] }, { "id": APP, "providers": ["fcm"] }])
+    );
     assert_eq!(
         info.body["relays"],
         json!({ "policy": "allow_list", "allowed": ["wss://node-1.veydan.net", "wss://nos.lol"] })
@@ -1135,4 +1151,58 @@ fn the_file_of_denied_keys_is_beside_the_database_unless_named() {
     let c = Config::parse("public_url = \"https://push.example.org\"\ndenied_keys_file = \"/opt/vpush/data/denied.txt\"\n").unwrap();
     assert_eq!(c.denied_keys_path(), std::path::Path::new("/opt/vpush/data/denied.txt"));
     assert!(Config::parse("public_url = \"https://push.example.org\"\ndenied_keys_file = \"denied.txt\"\n").is_err(), "an absolute path");
+}
+
+/// A device of APNs is registered without a question to Apple, which has
+/// none that sends nothing, and keeps its environment: the test push goes
+/// to APNs, alert and all.
+#[tokio::test]
+async fn a_device_of_apns_is_registered_with_its_environment_and_pushed_to() {
+    let server = start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server.apple)
+        .await;
+    let alice = Keys::generate();
+    let token = "a1b2".repeat(16);
+    let apns = |token: &str, environment: &str| {
+        json!({
+            "app_id": IOS,
+            "channel": { "provider": "apns", "token": token, "environment": environment },
+            "relays": [{ "url": "wss://node-1.veydan.net" }],
+        })
+    };
+
+    for (what, bad) in [
+        ("a token that is not hex", apns("not/a/token", "production")),
+        ("an environment there is none of", apns(&token, "staging")),
+    ] {
+        let answer = server.ask(&alice, "PUT", DEVICE, Some(bad)).await;
+        assert_eq!((answer.status, code(&answer)), (400, "bad_request"), "{what}: {}", answer.body);
+    }
+    assert!(server.apple.received_requests().await.unwrap().is_empty(), "Apple is asked nothing");
+
+    let put = server.ask(&alice, "PUT", DEVICE, Some(apns(&token, "sandbox"))).await;
+    assert_eq!(put.status, 200, "{}", put.body);
+    let stored = server
+        .store
+        .device(&alice.public_key().to_hex(), "phone-0001")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((stored.provider.as_str(), stored.sandbox), ("apns", true));
+    assert_eq!(stored.token_checked_at, None, "nothing is known of the token yet");
+
+    let test = server.ask(&alice, "POST", &format!("{DEVICE}/test"), None).await;
+    assert_eq!(test.status, 200, "{}", test.body);
+    assert_eq!(test.body["outcome"], "delivered");
+    let sent = server.apple.received_requests().await.unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].url.path(), format!("/3/device/{token}"));
+    assert_eq!(sent[0].headers["apns-topic"], IOS);
+    assert_eq!(sent[0].headers["apns-push-type"], "alert");
+    let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(body["type"], "test");
+    assert_eq!(body["trace"], test.body["trace"]);
+    assert_eq!(body["aps"]["mutable-content"], 1);
 }

@@ -105,6 +105,8 @@ pub struct Device {
     pub token_checked_at: Option<u64>,
     /// The push key of a device registered through the gateway.
     pub seal_to: Option<String>,
+    /// A device of APNs that takes its pushes from the sandbox.
+    pub sandbox: bool,
     pub relays: Vec<WatchedRelay>,
     pub groups: Vec<WatchedGroup>,
 }
@@ -292,6 +294,8 @@ pub struct Recipient {
     /// The push key of a device registered through the gateway: every push
     /// to it is sealed to it.
     pub seal_to: Option<String>,
+    /// A device of APNs that takes its pushes from the sandbox.
+    pub sandbox: bool,
 }
 
 /// What the server does on the relays.

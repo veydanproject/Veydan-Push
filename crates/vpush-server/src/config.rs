@@ -189,7 +189,6 @@ impl Default for TicketsConfig {
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub fcm: Option<FcmConfig>,
-    /// Reserved: the section is read and checked, delivery comes later.
     pub apns: Option<ApnsConfig>,
 }
 
@@ -205,11 +204,19 @@ pub struct FcmConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApnsConfig {
+    /// The key for token-based connections to APNs, as downloaded from the
+    /// developer account of Apple: a `.p8` file, a P-256 key in PKCS#8 PEM.
+    /// One key pushes to every app of the team, in production and in the
+    /// sandbox.
     pub key_file: PathBuf,
+    /// The id of that key, 10 characters, as the developer account shows it.
     pub key_id: String,
+    /// The team the key belongs to, 10 characters.
     pub team_id: String,
     /// Bundle id of the app.
     pub topic: String,
+    /// Where APNs is, in place of both its hosts. Set in tests only.
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -438,6 +445,14 @@ impl Config {
                         out.push(format!("apps.{id}.apns.{name}: is empty"));
                     }
                 }
+                if let Some(endpoint) = &apns.endpoint {
+                    match url::Url::parse(endpoint) {
+                        Ok(u) if matches!(u.scheme(), "http" | "https") => {}
+                        _ => out.push(format!(
+                            "apps.{id}.apns.endpoint: `{endpoint}` is not an http(s) address"
+                        )),
+                    }
+                }
             }
         }
 
@@ -574,11 +589,8 @@ impl Config {
                 }
             }
             if let Some(apns) = &app.apns {
-                if let Err(e) = std::fs::metadata(&apns.key_file) {
-                    out.push(format!(
-                        "apps.{id}.apns.key_file: cannot read {}: {e}",
-                        apns.key_file.display()
-                    ));
+                if let Err(e) = crate::delivery::apns::SigningKey::read(&apns.key_file) {
+                    out.push(format!("apps.{id}.apns.key_file: {e}"));
                 }
             }
         }
@@ -623,10 +635,21 @@ impl Config {
                 }
             }
             if let Some(apns) = &app.apns {
+                // The path and the ids, never the key.
+                out.push((
+                    format!("apps.{id}.apns.key_file"),
+                    apns.key_file.display().to_string(),
+                ));
                 out.push((
                     format!("apps.{id}.apns"),
-                    format!("topic {} (delivery is not built yet)", apns.topic),
+                    format!(
+                        "topic {}, key {}, team {}",
+                        apns.topic, apns.key_id, apns.team_id
+                    ),
                 ));
+                if let Some(endpoint) = &apns.endpoint {
+                    out.push((format!("apps.{id}.apns.endpoint"), endpoint.clone()));
+                }
             }
         }
         out.push(("store.path".to_string(), self.store.path.display().to_string()));
@@ -1032,5 +1055,28 @@ mod app_tests {
         let e = Config::load(&path).unwrap_err().to_string();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(e.contains("apps.app.fcm.service_account: cannot read"), "{e}");
+    }
+
+    #[test]
+    fn a_key_of_apns_that_is_not_one_is_found_when_loading() {
+        let dir = std::env::temp_dir().join(format!("vpush-cfg-apns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("apns.p8");
+        // A certificate where the key should be: the file of the wrong kind.
+        std::fs::write(&key, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
+        let path = dir.join("vpush.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "public_url = \"https://push.example.org\"\n\
+                 [apps.app.apns]\nkey_file = \"{}\"\nkey_id = \"K\"\nteam_id = \"T\"\ntopic = \"app\"\n",
+                key.display()
+            ),
+        )
+        .unwrap();
+        let e = Config::load(&path).unwrap_err().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(e.contains("apps.app.apns.key_file:"), "{e}");
+        assert!(e.contains("not a PKCS#8 PEM private key"), "{e}");
     }
 }

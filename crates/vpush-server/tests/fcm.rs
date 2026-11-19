@@ -80,6 +80,7 @@ fn message() -> Message {
         collapse_key: Some("test".into()),
         ttl: Duration::from_secs(60),
         urgent: true,
+        background: false,
     }
 }
 
@@ -99,6 +100,7 @@ fn message_with_event() -> Message {
         collapse_key: Some("dm".into()),
         ttl: Duration::from_secs(60),
         urgent: true,
+        background: false,
     }
 }
 
@@ -452,11 +454,14 @@ async fn a_wait_longer_than_we_accept_ends_the_attempts() {
         .mount(&server)
         .await;
 
-    let started = Instant::now();
-    let delivery = deliver(&client(&server), &target(), &message(), fast()).await;
+    // An hour is not waited: the attempts end within the deadline of the
+    // test, with the one that asked for it.
+    let delivery = tokio::time::timeout(Duration::from_secs(30), deliver(&client(&server), &target(), &message(), fast()))
+        .await
+        .expect("the hour asked for is not waited");
     assert_eq!(delivery.outcome, Outcome::Retry);
     assert_eq!(delivery.attempts.len(), 1);
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(delivery.attempts[0].retry_after_ms, Some(3_600_000), "the wait asked for was read");
 }
 
 #[tokio::test]

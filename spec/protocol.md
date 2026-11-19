@@ -4,7 +4,7 @@ For the one who writes a client. This file describes what the server does
 **today**; each stage adds its part here when it is built, not before.
 
 All bodies are JSON. The types are in the crate `vpush-proto`, and examples,
-word for word, in [golden/](golden/): a client's tests should read a copy of
+word for word, in [golden/](../golden/): a client's tests should read a copy of
 that folder.
 
 ## Every answer
@@ -118,13 +118,13 @@ PUT /v1/devices/{device_id}
 per identity on a device, kept for as long as the identity lives there.
 
 The body is everything about the device, every time
-([golden/device_put.json](golden/device_put.json)). What is not named is no
+([golden/device_put.json](../golden/device_put.json)). What is not named is no
 longer watched.
 
 | Field | | Meaning |
 |---|---|---|
 | `app_id` | required | The Android package or the iOS bundle id |
-| `channel` | required | `{ "provider": "fcm", "token": "…" }` |
+| `channel` | required | `{ "provider": "fcm", "token": "…" }`, or `{ "provider": "apns", "token": "<hex>", "environment": "production" }` (see [Through APNs](#through-apns)) |
 | `app_version` | | For the operator's eyes |
 | `prefs` | | `{ "dm": true, "groups": true }`; both true when absent |
 | `author_key` | | 64 hex. With it the server does not push a user's own group message back to the user. See [the mark of the author](#vp-16-hex-the-mark-of-the-author) |
@@ -163,7 +163,7 @@ told nothing of.
 
 Nothing of a registration that is refused is kept.
 
-The answer ([golden/device_answer.json](golden/device_answer.json)):
+The answer ([golden/device_answer.json](../golden/device_answer.json)):
 
 ```json
 { "device_id": "phone-0001", "expires_at": 1792592000,
@@ -215,7 +215,9 @@ for asks nobody.
 
 A push service that cannot be asked at the moment does not hold a
 registration back: the device is registered, and the first push to it says
-what the token is worth.
+what the token is worth. APNs has no question that sends nothing, so a
+token of APNs is never asked about: it is registered as it is, and the
+first push tells.
 
 At a private push server ([The gateway](#the-gateway-a-push-for-a-server-of-ones-own))
 the question is a push: a `test` push, sealed and woken through the
@@ -285,7 +287,9 @@ token: the same token under another `device_id` is the same device.
 ## What arrives on the device
 
 The same through every provider. Through FCM it arrives as the `data` of the
-message, where every value is a string; the keys are the same.
+message, where every value is a string; the keys are the same. Through APNs
+the same strings are the body of the push, beside `aps`
+([Through APNs](#through-apns)).
 
 ```json
 { "v": 2, "type": "dm", "event": "{\"id\":\"…\",\"kind\":1059,…}",
@@ -335,6 +339,80 @@ There is never a `notification` part in an FCM message. The app shows
 notifications itself, from `data`; this is what keeps one message from
 producing two notifications.
 
+### Through APNs
+
+An iPhone registers with its device token, as hex characters, and the
+environment of APNs it was given the token by:
+
+```json
+"channel": { "provider": "apns", "token": "<hex>", "environment": "production" }
+```
+
+`production` is a build of the App Store or of TestFlight, `sandbox` a build
+signed for development. APNs keeps the two apart, and a token of one is no
+token at the other: every push to the device goes to the host of its
+environment (`api.push.apple.com`, `api.sandbox.push.apple.com`). A token
+that is not hex, or another environment, is refused with `bad_request`.
+
+The body of the push is the keys above, every value a string as through
+FCM, with `aps` beside them:
+
+```json
+{ "aps": { "mutable-content": 1, "alert": { "loc-key": "push.new" },
+           "sound": "default", "thread-id": "3fa1c2d4" },
+  "v": "2", "type": "dm", "event": "{\"id\":\"…\",\"kind\":1059,…}",
+  "trace": "5f3a9c1e" }
+```
+
+A push is one of two kinds, the header `apns-push-type`:
+
+| `apns-push-type` | Pushes | `aps` |
+|---|---|---|
+| `alert` | `dm`, `group`, `sync`, `test`, `broadcast`, `sealed` | `"mutable-content": 1`, `"alert": { "loc-key": "push.new" }`, `"sound": "default"` (without it iOS shows the banner in silence), and `thread-id`, the chat |
+| `background` | `manifest_update`; a `test` that carries `check`; a `dm` about a note to the keeper of a channel (`["channel", "1"]` on the wrap), when it stands for that note alone | `"content-available": 1` and nothing else |
+
+An alert is opened by the Notification Service Extension of the app, which
+writes the text from the event, as the app does on Android. `push.new` is a
+key of the app's own strings, the text shown when the extension could not
+write one: the server writes no text in any language. A background push
+wakes the app and shows nothing; iOS hands it over when it sees fit, and
+may hold back many of them. A note to the keeper that came with messages
+counted beside it is a push about those messages, and an alert.
+
+| Header | Value |
+|---|---|
+| `apns-topic` | The bundle id of the app (`apps.<id>.apns.topic` of the server) |
+| `apns-push-type` | `alert` or `background`, above |
+| `apns-priority` | `10` for an urgent alert (a message, a group, `sync`, `test`, a call; `sealed` when its wake is urgent), `5` for the rest. A background push is always `5`: APNs refuses one at `10` |
+| `apns-expiration` | When APNs stops trying, Unix seconds: now and the time the push lives (a day; a minute for a call; ten minutes for a test). `0` for a push with no time to live: now or never |
+
+There is no `apns-collapse-id`. On iOS a push with one takes the place of
+the notification on the screen, and all direct messages are one chat to the
+server: each would wipe out the one before it. The key FCM replaces a
+waiting push by goes into `thread-id` instead, which only groups the
+notifications of a chat. So through APNs the pushes about a chat are not
+replaced while the phone is off; each is delivered, and the app tidies up.
+
+APNs takes a body of 4096 bytes at most, and counts every byte of the
+JSON: `aps`, the keys and the escaping of the quotes in `event` with the
+rest. A push with the event that weighs more is sent in its other form,
+`event_id` and `relay`, at once: the server measures it before sending and
+does not wait for APNs to refuse it. So an event that fits through FCM may
+come by its id through APNs.
+
+What APNs answers, as `vpush` tells it:
+
+| APNs | Outcome |
+|---|---|
+| `200` | `delivered` |
+| `410` (`Unregistered`), `400 BadDeviceToken` | `dead_token`: the device is not pushed to until it registers again |
+| `403 ExpiredProviderToken`, `403 InvalidProviderToken` | The server makes its token anew and sends the push once more; refused again, `rejected` |
+| `429`, `500`, `503` | `retry` |
+| any other, `400 DeviceTokenNotForTopic` among them | `rejected`: the device stays registered. A topic wrong in the config would say it of every device |
+
+A call is an alert like a message, marked `call`. VoIP pushes (PushKit) are
+not sent.
+
 ### By type
 
 | `type` | Sent when | Carries | Shown |
@@ -355,7 +433,8 @@ Channel service notes have a separate count from ordinary direct messages.
 
 ### One notification per chat
 
-A push about a chat replaces the one before it. Tell chats apart the way the
+A push about a chat replaces the one before it while it waits at FCM; at
+APNs it is grouped with it ([Through APNs](#through-apns)). Tell chats apart the way the
 server does: all direct messages are one chat, since the server cannot tell
 senders apart, and every group is a chat of its own.
 Kind 1059 wraps marked `["channel", "1"]` share a separate channel lane:
@@ -648,7 +727,7 @@ same for every private server. The private push server learns the ticket
 and this key; it never sees the token of FCM. `/v1/info` of a server in
 gateway mode says `"providers": ["gateway"]` and names its gateway:
 `"gateway": { "url": "https://…", "sender": "<64 hex>" }`
-([golden/info_private.json](golden/info_private.json)).
+([golden/info_private.json](../golden/info_private.json)).
 
 The ticket is checked as a token is ([The token is checked](#the-token-is-checked)),
 the only way a gateway can be asked about it: a `test` push, sealed and
@@ -670,7 +749,7 @@ The JSON of the push is the `data` map FCM would have carried, every value
 a string (`"v": "2"`), the keys in their order; the device hands what it
 opens to the same code as an FCM push. `base64url` is without padding, of
 the bytes of the NIP-44 payload (version, nonce, ciphertext, MAC), not of
-its usual base64 text. [golden/push_sealed.json](golden/push_sealed.json)
+its usual base64 text. [golden/push_sealed.json](../golden/push_sealed.json)
 opens with the keys its README names.
 
 The server key is a secp256k1 key the private push server made at its
@@ -685,7 +764,7 @@ POST {gateway}/v1/gateway/wake     body { "ticket": "<64 hex>", "blob": "<base64
 ```
 
 `urgent` is optional and `false` when absent
-([golden/wake.json](golden/wake.json), [golden/wake_urgent.json](golden/wake_urgent.json)).
+([golden/wake.json](../golden/wake.json), [golden/wake_urgent.json](../golden/wake_urgent.json)).
 The gateway sends a wake at high priority (FCM `HIGH`) only when it says
 `urgent: true`, and at normal priority otherwise. A private push server
 says it only for the push of a call — a ring or its end, `call` inside,
@@ -780,7 +859,7 @@ runs.
   server and the groups one of them is in, and so that these keys use
   it. The event itself stays sealed. The relays of the Veydan network
   take VPush by the key of the peers, past their read policy
-  (`spec/vguard.md`); a relay of somebody else that gives wraps to their
+  ([Veydan-Guard access rules](https://github.com/veydanproject/Veydan-Guard/blob/main/spec/vguard.md)); a relay of somebody else that gives wraps to their
   own key only cannot be watched at all (above).
 
 ### What it holds back, and cannot stop

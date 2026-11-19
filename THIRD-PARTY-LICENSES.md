@@ -4,13 +4,13 @@ VPush is built from the open-source crates below. This file goes with every
 copy of the server, next to its binary. It lists every crate of
 `Cargo.lock` with its licence.
 
-- **Rust crates:** 349
+- **Rust crates:** 348
 
 ## License summary
 
 | License | Count |
 |---|---:|
-| MIT OR Apache-2.0 | 203 |
+| MIT OR Apache-2.0 | 202 |
 | MIT | 63 |
 | Apache-2.0 OR MIT | 20 |
 | Unicode-3.0 | 18 |
@@ -190,7 +190,7 @@ copy of the server, next to its binary. It lists every crate of
 | js-sys | 0.3.106 | MIT OR Apache-2.0 |
 | lazy_static | 1.5.0 | MIT OR Apache-2.0 |
 | libc | 0.2.189 | MIT OR Apache-2.0 |
-| libsqlite3-sys | 0.37.0 | MIT |
+| libsqlite3-sys | 0.39.1 | MIT |
 | litemap | 0.8.3 | Unicode-3.0 |
 | lock_api | 0.4.14 | MIT OR Apache-2.0 |
 | log | 0.4.34 | MIT OR Apache-2.0 |
@@ -290,7 +290,6 @@ copy of the server, next to its binary. It lists every crate of
 | sqlx-macros-core | 0.9.0 | MIT OR Apache-2.0 |
 | sqlx-mysql | 0.9.0 | MIT OR Apache-2.0 |
 | sqlx-postgres | 0.9.0 | MIT OR Apache-2.0 |
-| sqlx-sqlite | 0.9.0 | MIT OR Apache-2.0 |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 |
 | stringprep | 0.1.5 | MIT OR Apache-2.0 |
 | strsim | 0.11.1 | MIT |

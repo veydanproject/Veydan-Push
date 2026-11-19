@@ -11,7 +11,7 @@ resolver = "2"
 members = ["crates/vpush-proto", "crates/vpush-server", "crates/vpush"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 publish = false
 authors = ["Veydan Project"]
@@ -20,7 +20,7 @@ authors = ["Veydan Project"]
 license-file = "LICENSE"
 
 [workspace.dependencies]
-veydan-denied = { git = "https://github.com/veydanproject/Veydan-Common", tag = "v0.1.0" }
+veydan-denied = { git = "https://github.com/veydanproject/Veydan-Common", tag = "v0.1.1" }
 vpush-proto = { path = "crates/vpush-proto" }
 vpush-server = { path = "crates/vpush-server" }
 
@@ -56,3 +56,5 @@ lto = "thin"
 codegen-units = 4
 strip = true
 panic = "abort"
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
